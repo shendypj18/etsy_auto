@@ -310,7 +310,10 @@ def scan_for_archives(source_folder: str) -> List[Path]:
     
     found_files = []
     for ext in extensions:
-        found_files.extend(list(source_path.glob(f"*{ext}")))
+        found_files.extend([
+            f for f in source_path.glob(f"*{ext}")
+            if not f.name.startswith("._")
+        ])
     
     archives = []
     for arch in sorted(found_files):
@@ -432,6 +435,10 @@ def find_files_by_extension(root_folder: Path, extensions: List[str]) -> List[Pa
         # Handle both cases: with and without dot
         ext_pattern = ext if ext.startswith('.') else f'.{ext}'
         for file in root_folder.rglob(f"*{ext_pattern}"):
+            # Skip macOS resource fork files
+            if file.name.startswith("._"):
+                continue
+            
             # Apply blacklist on RELATIVE path only
             rel_path = str(file.relative_to(root_folder))
             if any(pattern.lower() in rel_path.lower() for pattern in BLACKLIST_PATTERNS):
@@ -616,8 +623,13 @@ def authenticate_gdrive(client_secrets_path: str = "client_secrets.json"):
             # Authenticate if no credentials found
             gauth.LocalWebserverAuth()
         elif gauth.access_token_expired:
-            # Refresh if expired
-            gauth.Refresh()
+            # Refresh if expired — fallback to re-auth if refresh fails
+            try:
+                gauth.Refresh()
+            except Exception:
+                logger.warning("Token refresh failed, re-authenticating...")
+                os.remove("gdrive_credentials.json")
+                gauth.LocalWebserverAuth()
         else:
             # Authorize with valid credentials
             gauth.Authorize()
@@ -846,9 +858,42 @@ def process_archives(
                     print_status("Google Drive authentication successful!", "success")
             except Exception as e:
                 if interactive:
-                    print_status(f"Google Drive auth failed: {e}", "warning")
+                    print_status(f"Google Drive auth failed: {e}", "error")
+                    print()
+                    while True:
+                        print(f"  {Colors.YELLOW}What would you like to do?{Colors.END}")
+                        print(f"    {Colors.CYAN}1.{Colors.END} Retry authentication")
+                        print(f"    {Colors.CYAN}2.{Colors.END} Skip uploads (process locally only)")
+                        print(f"    {Colors.CYAN}3.{Colors.END} Quit")
+                        choice = input(f"\n  {Colors.BOLD}Choose [1/2/3]: {Colors.END}").strip()
+                        
+                        if choice == "1":
+                            try:
+                                # Delete old credentials and retry
+                                cred_file = "gdrive_credentials.json"
+                                if os.path.exists(cred_file):
+                                    os.remove(cred_file)
+                                    print_status("Old credentials removed", "clean")
+                                print_status("Retrying authentication...", "progress")
+                                drive = authenticate_gdrive()
+                                print_status("Google Drive authentication successful!", "success")
+                                break
+                            except Exception as retry_err:
+                                print_status(f"Retry failed: {retry_err}", "error")
+                                continue
+                        elif choice == "2":
+                            print_status("Skipping Google Drive uploads — processing locally only", "warning")
+                            upload_to_drive = False
+                            drive = None
+                            break
+                        elif choice == "3":
+                            print_status("Quitting...", "warning")
+                            return results
+                        else:
+                            print_status("Invalid choice, please enter 1, 2, or 3", "warning")
                 else:
                     logger.warning(f"Google Drive auth failed, skipping uploads: {e}")
+                    upload_to_drive = False
                 results['errors'].append(f"GDrive auth failed: {e}")
         
         # Step 3: Process each archive
@@ -862,6 +907,68 @@ def process_archives(
                 print_progress_bar(idx - 1, total_archives, prefix="  Overall Progress")
             else:
                 logger.info(f"Processing: {archive.name}")
+            
+            # --- Resume logic: skip already processed archives ---
+            clean_project_name = clean_name(archive.stem)
+            project_folder = output_path / clean_project_name
+            link_file = project_folder / LINK_FILENAME
+            
+            # Check if fully processed (link file exists = extracted + zipped + uploaded)
+            if link_file.exists():
+                if interactive:
+                    print_status(f"  Already processed & uploaded — skipping", "success")
+                else:
+                    logger.info(f"Skipping (already done): {archive.name}")
+                results['processed_archives'] += 1
+                continue
+            
+            # Check if ZIP exists but upload was not completed
+            existing_zips = list(project_folder.glob("*_STL_*.zip")) if project_folder.exists() else []
+            if existing_zips and drive and upload_to_drive:
+                if interactive:
+                    print_status(f"  ZIP already exists — resuming upload only", "warning")
+                else:
+                    logger.info(f"Resuming upload for: {archive.name}")
+                
+                for existing_zip in existing_zips:
+                    try:
+                        if interactive:
+                            print_status(f"  Uploading to Google Drive: {existing_zip.name}...", "upload")
+                        file_id, download_link = upload_to_gdrive(
+                            drive, existing_zip, gdrive_folder_id
+                        )
+                        results['uploaded_files'].append({
+                            'file': existing_zip.name,
+                            'drive_id': file_id,
+                            'link': download_link
+                        })
+                        results['created_zips'].append(str(existing_zip))
+                        
+                        if download_link:
+                            create_link_file(project_folder, download_link, LINK_FILENAME)
+                            if interactive:
+                                print_status(f"  Link file created: {LINK_FILENAME}", "success")
+                        
+                        if interactive:
+                            print_status(f"  Uploaded successfully!", "success")
+                        
+                        if DELETE_AFTER_UPLOAD:
+                            try:
+                                existing_zip.unlink()
+                                if interactive:
+                                    print_status(f"  Local file deleted to save space", "success")
+                            except Exception as cleanup_err:
+                                logger.warning(f"Failed to delete local zip {existing_zip}: {cleanup_err}")
+                    except Exception as e:
+                        if interactive:
+                            print_status(f"  Upload failed: {e}", "error")
+                        else:
+                            logger.error(f"Upload failed for {existing_zip.name}: {e}")
+                        results['errors'].append(f"Upload failed: {existing_zip.name}")
+                
+                results['processed_archives'] += 1
+                continue
+            # --- End resume logic ---
             
             try:
                 # Extract archive
@@ -877,8 +984,6 @@ def process_archives(
                     logger.debug(f"  Using effective root: {eff_root.relative_to(extract_dir)}")
                 
                 # Create project-specific output folder
-                clean_project_name = clean_name(archive.stem)
-                project_folder = output_path / clean_project_name
                 project_folder.mkdir(parents=True, exist_ok=True)
                 
                 images_dest = project_folder / "Images"
