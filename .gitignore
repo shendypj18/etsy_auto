@@ -1,0 +1,49 @@
+# Credentials (NEVER commit these!)
+client_secrets.json
+service_account.json
+gdrive_credentials.json
+*.credentials
+
+# Telegram session files
+*.session
+*.session-journal
+
+# Config with credentials
+config.py
+
+# Output folders
+output/
+downloads/
+temp_extract/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# User added
+block.txt
+clean.txt
+archive/
+archives/
