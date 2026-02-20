@@ -1,0 +1,1266 @@
+"""
+STL File Management and Google Drive Integration Script
+
+This script automates:
+1. Scanning for .zip/.rar files in a folder
+2. Extracting and sorting files (images and STL)
+3. Re-compressing STL files
+4. Uploading to Google Drive via PyDrive2
+5. Cleanup of temporary files
+
+Author: Shendy PJ
+"""
+
+import os
+import sys
+import shutil
+import zipfile
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import List, Optional
+
+try:
+    import rarfile
+    RAR_SUPPORT = True
+except ImportError:
+    RAR_SUPPORT = False
+    logging.warning("rarfile not installed. .rar extraction will not be available.")
+
+try:
+    import py7zr
+    SEVENZIP_SUPPORT = True
+except ImportError:
+    SEVENZIP_SUPPORT = False
+    logging.warning("py7zr not installed. .7z extraction will not be available.")
+
+try:
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+    GDRIVE_SUPPORT = True
+except ImportError:
+    GDRIVE_SUPPORT = False
+    logging.warning("PyDrive2 not installed. Google Drive upload will not be available.")
+
+# Try to import config
+try:
+    from config import (
+        BLACKLIST_PATTERNS, FLATTEN_STL_STRUCTURE, LINK_FILENAME, 
+        CLEAN_PATTERNS, SIZE_BLOCK_RULES, DELETE_AFTER_UPLOAD
+    )
+except ImportError:
+    BLACKLIST_PATTERNS = ["+NSFW", ".url", ".txt", "Boost"]
+    FLATTEN_STL_STRUCTURE = False
+    LINK_FILENAME = "link_download_here.txt"
+    CLEAN_PATTERNS = ["CW Studio"]
+    SIZE_BLOCK_RULES = {"Base.stl": 5 * 1024 * 1024}
+
+# Import helper functions
+from gdrive_handler import create_link_file
+
+# ============================================================================
+# SCRIPT METADATA
+# ============================================================================
+
+__version__ = "1.0.0"
+__author__ = "Shendy PJ"
+__description__ = "STL File Manager - Extract, Sort & Upload to Google Drive"
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def clean_name(text: str, patterns: List[str] = CLEAN_PATTERNS) -> str:
+    """Remove unwanted patterns from string and cleanup whitespace."""
+    if not text:
+        return text
+    
+    cleaned = text
+    for pattern in patterns:
+        cleaned = cleaned.replace(pattern, "")
+    
+    # Remove extra spaces, including multi-spaces and leading/trailing
+    cleaned = " ".join(cleaned.split()).strip()
+    
+    # Remove double dashes/hyphens that might result from cleaning
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    while " – – " in cleaned:
+        cleaned = cleaned.replace(" – – ", " – ")
+        
+    return cleaned.strip()
+
+
+# ============================================================================
+# TERMINAL DISPLAY & COLORS
+# ============================================================================
+
+class Colors:
+    """ANSI color codes for terminal display."""
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+
+def print_banner():
+    """Display an attractive ASCII banner with script info."""
+    banner = f"""
+{Colors.CYAN}{Colors.BOLD}
+╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║   ███████╗████████╗██╗         ███╗   ███╗ ██████╗ ██████╗           ║
+║   ██╔════╝╚══██╔══╝██║         ████╗ ████║██╔════╝ ██╔══██╗          ║
+║   ███████╗   ██║   ██║         ██╔████╔██║██║  ███╗██████╔╝          ║
+║   ╚════██║   ██║   ██║         ██║╚██╔╝██║██║   ██║██╔══██╗          ║
+║   ███████║   ██║   ███████╗    ██║ ╚═╝ ██║╚██████╔╝██║  ██║          ║
+║   ╚══════╝   ╚═╝   ╚══════╝    ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝          ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  {Colors.YELLOW}📁 STL File Management & Google Drive Integration{Colors.CYAN}                  ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  {Colors.GREEN}Version:{Colors.END}  {__version__:<10} {Colors.CYAN}                                            ║
+║  {Colors.GREEN}Author:{Colors.END}   {__author__:<15} {Colors.CYAN}                                       ║
+╠══════════════════════════════════════════════════════════════════════╣
+║  {Colors.YELLOW}Features:{Colors.END}                                                          {Colors.CYAN}║
+║  {Colors.END}  ✓ Scan & extract .zip/.rar files                               {Colors.CYAN}║
+║  {Colors.END}  ✓ Sort images (.jpg, .png, .jpeg, .webp)                        {Colors.CYAN}║
+║  {Colors.END}  ✓ Extract & recompress STL files                               {Colors.CYAN}║
+║  {Colors.END}  ✓ Upload to Google Drive via PyDrive2                          {Colors.CYAN}║
+║  {Colors.END}  ✓ Automatic cleanup of temp files                              {Colors.CYAN}║
+╚══════════════════════════════════════════════════════════════════════╝
+{Colors.END}"""
+    print(banner)
+
+
+def print_status(message: str, type: str = "info"):
+    """Print formatted status messages."""
+    icons = {
+        "success": f"{Colors.GREEN}✅",
+        "error": f"{Colors.RED}❌",
+        "info": f"{Colors.BLUE}ℹ️ ",
+        "warning": f"{Colors.YELLOW}⚠️ ",
+        "progress": f"{Colors.CYAN}🔄",
+        "upload": f"{Colors.CYAN}☁️ ",
+        "clean": f"{Colors.CYAN}✨"
+    }
+    icon = icons.get(type, icons["info"])
+    print(f"{icon} {message}{Colors.END}")
+
+
+def render_progress_bar(current: int, total: int, prefix: str = "", bar_length: int = 30):
+    """Render a progress bar with size info."""
+    if total <= 0: return
+    percent = float(current) * 100 / total
+    filled_length = int(round(bar_length * current / float(total)))
+    
+    # Use block characters for the bar
+    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+    
+    # Convert sizes to MB
+    current_mb = current / (1024 * 1024)
+    total_mb = total / (1024 * 1024)
+    
+    # Format the line
+    output = f"\r{prefix} [{bar}] {percent:3.0f}% ({current_mb:5.1f} MB / {total_mb:5.1f} MB)"
+    
+    # Print with carriage return
+    sys.stdout.write(output)
+    sys.stdout.flush()
+    
+    if current >= total:
+        print() # New line on completion
+
+
+def print_progress_bar(current: int, total: int, prefix: str = "", suffix: str = "", length: int = 40):
+    """Display a progress bar in the terminal."""
+    if total == 0:
+        percent = 100
+        filled = length
+    else:
+        percent = int(100 * current / total)
+        filled = int(length * current / total)
+    
+    bar = f"{Colors.GREEN}█{Colors.END}" * filled + f"{Colors.HEADER}░{Colors.END}" * (length - filled)
+    print(f"\r{prefix} [{bar}] {percent}% ({current}/{total}) {suffix}", end="", flush=True)
+    
+    if current >= total:
+        print()  # New line when complete
+
+
+def print_section(title: str):
+    """Print a section header."""
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'─' * 70}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.YELLOW}  {title}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'─' * 70}{Colors.END}")
+
+
+def print_summary_box(results: dict, total_archives: int):
+    """Print a summary box with processing results."""
+    success = results['processed_archives']
+    failed = len(results['errors'])
+    
+    # Determine overall status color
+    if failed == 0 and success > 0:
+        status_color = Colors.GREEN
+        status_text = "SUCCESS"
+        status_icon = "✅"
+    elif success == 0:
+        status_color = Colors.RED
+        status_text = "FAILED"
+        status_icon = "❌"
+    else:
+        status_color = Colors.YELLOW
+        status_text = "PARTIAL"
+        status_icon = "⚠️"
+    
+    print(f"""
+{Colors.CYAN}╔══════════════════════════════════════════════════════════════════════╗
+║{Colors.BOLD}                        📊 PROCESSING SUMMARY                         {Colors.CYAN}║
+╠══════════════════════════════════════════════════════════════════════╣{Colors.END}
+{Colors.CYAN}║{Colors.END}  Status:             {status_color}{status_icon} {status_text:<50}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}╠══════════════════════════════════════════════════════════════════════╣{Colors.END}
+{Colors.CYAN}║{Colors.END}  📦 Total Archives:   {total_archives:<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  {Colors.GREEN}✅ Processed:{Colors.END}        {success:<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  {Colors.RED}❌ Failed:{Colors.END}           {failed:<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}╠══════════════════════════════════════════════════════════════════════╣{Colors.END}
+{Colors.CYAN}║{Colors.END}  🖼️  Images Extracted: {results['total_images']:<47}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  🔧 STL Files Found:  {results['total_stl_files']:<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  📁 ZIPs Created:     {len(results['created_zips']):<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  ☁️  Files Uploaded:   {len(results['uploaded_files']):<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}╚══════════════════════════════════════════════════════════════════════╝{Colors.END}
+""")
+    
+    # Print errors if any
+    if results['errors']:
+        print(f"{Colors.RED}{Colors.BOLD}⚠️  Errors Encountered:{Colors.END}")
+        for i, err in enumerate(results['errors'], 1):
+            print(f"   {Colors.RED}{i}. {err}{Colors.END}")
+        print()
+
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+def setup_logging(log_level: int = logging.INFO) -> logging.Logger:
+    """
+    Setup logging configuration for the script.
+    
+    Args:
+        log_level: Logging level (default: INFO)
+    
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger("STLManager")
+    logger.setLevel(log_level)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    
+    # Formatter with timestamp
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console_handler.setFormatter(formatter)
+    
+    # Avoid duplicate handlers
+    if not logger.handlers:
+        logger.addHandler(console_handler)
+    
+    return logger
+
+
+logger = setup_logging()
+
+
+# ============================================================================
+# FILE SCANNING FUNCTIONS
+# ============================================================================
+
+def scan_for_archives(source_folder: str) -> List[Path]:
+    """
+    Scan a folder for .zip and .rar files, handling multi-part archives.
+    
+    Args:
+        source_folder: Path to the folder to scan
+    
+    Returns:
+        List of Path objects for found archive files
+    """
+    logger.info(f"Scanning folder: {source_folder}")
+    
+    source_path = Path(source_folder)
+    if not source_path.exists():
+        raise FileNotFoundError(f"Source folder not found: {source_folder}")
+    
+    import re
+    
+    # Entry point extensions
+    extensions = [".zip", ".rar", ".7z", ".001"]
+    
+    found_files = []
+    for ext in extensions:
+        found_files.extend(list(source_path.glob(f"*{ext}")))
+    
+    archives = []
+    for arch in sorted(found_files):
+        name = arch.name.lower()
+        
+        # Handle RAR multi-part (.part1.rar, .part2.rar)
+        if ".part" in name and name.endswith(".rar"):
+            match = re.search(r"\.part0*(\d+)\.rar$", name)
+            if match and int(match.group(1)) != 1:
+                logger.debug(f"  Skipping extra RAR volume: {arch.name}")
+                continue
+        
+        # Handle split volumes (.001, .002, etc.)
+        match_split = re.search(r"\.0*(\d+)$", name)
+        if match_split and int(match_split.group(1)) != 1:
+            logger.debug(f"  Skipping extra split volume: {arch.name}")
+            continue
+            
+        archives.append(arch)
+    
+    logger.info(f"Total archives found after filtering: {len(archives)}")
+    return archives
+
+
+# ============================================================================
+# EXTRACTION FUNCTIONS
+# ============================================================================
+
+def extract_archive(archive_path: Path, temp_folder: Path) -> Path:
+    """
+    Extract a .zip, .rar, or .7z archive (including multi-part) to a temporary folder.
+    
+    Args:
+        archive_path: Path to the archive file
+        temp_folder: Path to the temporary extraction folder
+    
+    Returns:
+        Path to the extraction directory
+    """
+    # Clean the name for the temporary folder to avoid blacklist collisions
+    safe_stem = clean_name(archive_path.stem)
+    extract_dir = temp_folder / f"_ext_{safe_stem}"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Extracting: {archive_path.name} -> {extract_dir}")
+    
+    try:
+        suffix = archive_path.suffix.lower()
+        name = archive_path.name.lower()
+        
+        # Handle ZIP
+        if suffix == ".zip":
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+                logger.info(f"Successfully extracted ZIP: {archive_path.name}")
+        
+        # Handle RAR (rarfile handles volumes automatically if pointed at the first)
+        elif suffix == ".rar":
+            if not RAR_SUPPORT:
+                raise ImportError("rarfile library not installed for .rar support")
+            with rarfile.RarFile(archive_path, 'r') as rar_ref:
+                rar_ref.extractall(extract_dir)
+                logger.info(f"Successfully extracted RAR: {archive_path.name}")
+        
+        # Handle 7z and Generic Split Volumes (.001)
+        elif suffix == ".7z" or name.endswith(".001"):
+            if not SEVENZIP_SUPPORT:
+                raise ImportError("py7zr library not installed for .7z support")
+            with py7zr.SevenZipFile(archive_path, mode='r') as z_ref:
+                z_ref.extractall(extract_dir)
+                logger.info(f"Successfully extracted 7z/split: {archive_path.name}")
+        
+        else:
+            raise ValueError(f"Unsupported archive format: {archive_path.suffix}")
+    
+    except Exception as e:
+        logger.error(f"Extraction failed for {archive_path.name}: {e}")
+        # Clean up the failed extraction directory
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        raise
+    
+    return extract_dir
+
+
+# ============================================================================
+# FILE SORTING FUNCTIONS
+# ============================================================================
+
+def get_effective_root(extract_path: Path) -> Path:
+    """Find the deepest folder that contains more than one item or at least one file."""
+    current = extract_path
+    while True:
+        try:
+            items = [i for i in current.iterdir() if not i.name.startswith('.')]
+            if len(items) == 1 and items[0].is_dir():
+                current = items[0]
+            else:
+                break
+        except (PermissionError, OSError):
+            break
+    return current
+
+
+def find_files_by_extension(root_folder: Path, extensions: List[str]) -> List[Path]:
+    """
+    Recursively find all files with specified extensions in a folder.
+    
+    Args:
+        root_folder: Root folder to search
+        extensions: List of file extensions (e.g., ['.jpg', '.png'])
+    
+    Returns:
+        List of Path objects for found files
+    """
+    found_files = []
+    
+    for ext in extensions:
+        # Handle both cases: with and without dot
+        ext_pattern = ext if ext.startswith('.') else f'.{ext}'
+        for file in root_folder.rglob(f"*{ext_pattern}"):
+            # Apply blacklist on RELATIVE path only
+            rel_path = str(file.relative_to(root_folder))
+            if any(pattern.lower() in rel_path.lower() for pattern in BLACKLIST_PATTERNS):
+                logger.debug(f"  Skipping blacklisted file/path: {rel_path}")
+                continue
+            
+            # Smart Blocking based on Size
+            if file.name in SIZE_BLOCK_RULES:
+                threshold = SIZE_BLOCK_RULES[file.name]
+                file_size = file.stat().st_size
+                if file_size < threshold:
+                    logger.debug(f"  Smart blocking {file.name} (size: {file_size/1024/1024:.2f}MB < {threshold/1024/1024:.2f}MB)")
+                    continue
+                else:
+                    logger.debug(f"  Keeping {file.name} (size: {file_size/1024/1024:.2f}MB >= {threshold/1024/1024:.2f}MB)")
+                
+            found_files.append(file)
+    
+    return found_files
+
+
+def move_images_to_folder(
+    extract_dir: Path, 
+    images_folder: Path, 
+    original_archive_name: str,
+    preserve_structure: bool = True
+) -> List[Path]:
+    """
+    Find and move all image files to a dedicated Images folder.
+    
+    Args:
+        extract_dir: Path to the extracted content
+        images_folder: Destination folder for images
+        original_archive_name: Original archive name for prefixing
+        preserve_structure: Whether to preserve subfolder structure
+    
+    Returns:
+        List of moved image file paths
+    """
+    image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+    images = find_files_by_extension(extract_dir, image_extensions)
+    
+    logger.info(f"Found {len(images)} image files in {extract_dir.name}")
+    
+    # Create a subfolder for this specific archive inside the images folder
+    archive_images_dir = images_folder / Path(original_archive_name).stem
+    archive_images_dir.mkdir(parents=True, exist_ok=True)
+    
+    moved_images = []
+    
+    for img in images:
+        if preserve_structure:
+            # Preserve subfolder structure relative to extraction dir
+            rel_path = img.relative_to(extract_dir)
+            dest_path = archive_images_dir / rel_path
+        else:
+            # Flatten: Create new filename with prefix
+            prefix = Path(original_archive_name).stem
+            new_name = f"{prefix}_{img.name}"
+            dest_path = archive_images_dir / new_name
+        
+        # Ensure parent directories exist
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Handle duplicate names
+        counter = 1
+        while dest_path.exists():
+            stem, suffix = os.path.splitext(dest_path.name)
+            dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
+            counter += 1
+        
+        try:
+            shutil.move(str(img), str(dest_path))
+            moved_images.append(dest_path)
+            logger.debug(f"Moved image: {img.name} -> {dest_path.name}")
+        except Exception as e:
+            logger.error(f"Failed to move image {img.name}: {e}")
+    
+    logger.info(f"Moved {len(moved_images)} images to {images_folder}")
+    return moved_images
+
+
+def find_stl_files(extract_dir: Path) -> List[Path]:
+    """
+    Find all .stl, .obj, .3mf, .zip, and .rar files in the extracted directory.
+    
+    Args:
+        extract_dir: Path to the extracted content
+    
+    Returns:
+        List of Path objects for model files
+    """
+    model_extensions = ['.stl', '.obj', '.3mf', '.zip', '.rar', '.7z']
+    stl_files = find_files_by_extension(extract_dir, model_extensions)
+    logger.info(f"Found {len(stl_files)} model files in {extract_dir.name}")
+    return stl_files
+
+
+# ============================================================================
+# RE-COMPRESSION FUNCTIONS
+# ============================================================================
+
+def create_stl_zip(
+    stl_files: List[Path], 
+    output_path: Path, 
+    root_path: Path,
+    flatten_structure: bool = False
+) -> Optional[Path]:
+    """
+    Create a new ZIP file containing only STL files.
+    
+    Args:
+        stl_files: List of STL file paths
+        output_path: Path for the output ZIP file
+        root_path: Root path to calculate relative paths from
+        flatten_structure: If True, flatten folder structure in ZIP
+    
+    Returns:
+        Path to the created ZIP file, or None if no files to zip
+    """
+    if not stl_files:
+        logger.warning("No STL files to compress")
+        return None
+    
+    logger.info(f"Creating STL ZIP: {output_path}")
+    
+    try:
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for stl_file in stl_files:
+                if flatten_structure:
+                    # Store with just the filename (flattened + cleaned)
+                    arcname = clean_name(stl_file.name)
+                else:
+                    # Preserve structure relative to root_path + cleaned folders
+                    rel_parts = stl_file.relative_to(root_path).parts
+                    cleaned_parts = [clean_name(p) for p in rel_parts]
+                    arcname = os.path.join(*cleaned_parts)
+                
+                zipf.write(stl_file, arcname)
+                logger.debug(f"Added to ZIP: {arcname}")
+        
+        logger.info(f"Created ZIP with {len(stl_files)} STL files: {output_path}")
+        return output_path
+    
+    except Exception as e:
+        logger.error(f"Failed to create ZIP: {e}")
+        raise
+
+
+# ============================================================================
+# GOOGLE DRIVE UPLOAD FUNCTIONS
+# ============================================================================
+
+def authenticate_gdrive(client_secrets_path: str = "client_secrets.json"):
+    """
+    Authenticate with Google Drive using client_secrets.json.
+    
+    Args:
+        client_secrets_path: Path to the client_secrets.json file
+    
+    Returns:
+        Authenticated GoogleDrive instance
+    """
+    if not GDRIVE_SUPPORT:
+        raise ImportError("PyDrive2 is not installed. Install it with: pip install pydrive2")
+    
+    logger.info("Authenticating with Google Drive...")
+    
+    if not os.path.exists(client_secrets_path):
+        raise FileNotFoundError(
+            f"client_secrets.json not found at: {client_secrets_path}\n"
+            "Please follow the setup instructions in SETUP_GUIDE.md"
+        )
+    
+    try:
+        gauth = GoogleAuth()
+        
+        # Try to load saved credentials
+        gauth.LoadCredentialsFile("gdrive_credentials.json")
+        
+        if gauth.credentials is None:
+            # Authenticate if no credentials found
+            gauth.LocalWebserverAuth()
+        elif gauth.access_token_expired:
+            # Refresh if expired
+            gauth.Refresh()
+        else:
+            # Authorize with valid credentials
+            gauth.Authorize()
+        
+        # Save credentials for next run
+        gauth.SaveCredentialsFile("gdrive_credentials.json")
+        
+        drive = GoogleDrive(gauth)
+        logger.info("Successfully authenticated with Google Drive")
+        return drive
+    
+    except Exception as e:
+        logger.error(f"Google Drive authentication failed: {e}")
+        raise
+
+
+def upload_to_gdrive(
+    drive, 
+    file_path: Path, 
+    folder_id: Optional[str] = None,
+    show_progress: bool = True
+) -> tuple[str, str]:
+    """
+    Upload a file to Google Drive.
+    
+    Args:
+        drive: Authenticated GoogleDrive instance
+        file_path: Path to the file to upload
+        folder_id: Optional Google Drive folder ID (uploads to root if None)
+    
+    Returns:
+        Google Drive file ID of uploaded file
+    """
+    logger.info(f"Uploading to Google Drive: {file_path.name}")
+    
+    try:
+        # Create file metadata
+        file_metadata = {'title': file_path.name}
+        
+        if folder_id:
+            file_metadata['parents'] = [{'id': folder_id}]
+        
+        # Create and upload file
+        gfile = drive.CreateFile(file_metadata)
+        
+        if show_progress:
+            def progress_cb(current, total):
+                render_progress_bar(current, total, prefix="   Uploading:")
+                
+            # Use the underlying resumable upload for progress
+            from googleapiclient.http import MediaFileUpload
+            import mimetypes
+            
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            mime_type = mime_type or 'application/octet-stream'
+            
+            media = MediaFileUpload(
+                str(file_path), 
+                mimetype=mime_type, 
+                resumable=True,
+                chunksize=5 * 1024 * 1024 # Increased chunk size for stability
+            )
+            
+            if not drive.auth.service:
+                drive.auth.Authorize()
+            request = drive.auth.service.files().insert(body=file_metadata, media_body=media)
+            
+            response = None
+            chunk_retries = 0
+            max_retries = 5
+            
+            while response is None:
+                try:
+                    status, response = request.next_chunk()
+                    if status:
+                        progress_cb(int(status.resumable_progress), file_path.stat().st_size)
+                    chunk_retries = 0 # Reset on success
+                except Exception as e:
+                    chunk_retries += 1
+                    if chunk_retries > max_retries:
+                        logger.error(f"Chunk upload failed after {max_retries} retries: {e}")
+                        raise
+                    import time
+                    wait = chunk_retries * 2
+                    logger.warning(f"Chunk upload error: {e}. Retrying in {wait}s...")
+                    time.sleep(wait)
+            
+            progress_cb(file_path.stat().st_size, file_path.stat().st_size)
+            file_id = response.get('id')
+            gfile = drive.CreateFile({'id': file_id})
+            gfile.FetchMetadata()
+        else:
+            gfile.SetContentFile(str(file_path))
+            gfile.Upload()
+        
+        file_id = gfile['id']
+        logger.info(f"Upload successful! File ID: {file_id}")
+        
+        # Get shareable link
+        gfile.InsertPermission({
+            'type': 'anyone',
+            'value': 'anyone',
+            'role': 'reader'
+        })
+        
+        link = gfile['alternateLink']
+        logger.info(f"Shareable link: {link}")
+        
+        return file_id, link
+    
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise
+
+
+# ============================================================================
+# CLEANUP FUNCTIONS
+# ============================================================================
+
+def cleanup_temp_folder(temp_folder: Path) -> None:
+    """
+    Remove the temporary extraction folder and its contents.
+    
+    Args:
+        temp_folder: Path to the temporary folder to remove
+    """
+    logger.info(f"Cleaning up temporary folder: {temp_folder}")
+    
+    try:
+        if temp_folder.exists():
+            shutil.rmtree(temp_folder)
+            logger.info("Cleanup completed successfully")
+        else:
+            logger.warning(f"Temp folder not found: {temp_folder}")
+    
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+        raise
+
+
+# ============================================================================
+# MAIN ORCHESTRATION FUNCTION
+# ============================================================================
+
+def process_archives(
+    source_folder: str,
+    output_folder: str = "output",
+    gdrive_folder_id: Optional[str] = None,
+    upload_to_drive: bool = True,
+    flatten_stl_structure: bool = True,
+    cleanup_after: bool = True,
+    interactive: bool = True
+) -> dict:
+    """
+    Main function to process archives through the complete workflow.
+    
+    Args:
+        source_folder: Folder containing .zip/.rar files to process
+        output_folder: Folder for output files (Images, STL zips)
+        gdrive_folder_id: Optional Google Drive folder ID for uploads
+        upload_to_drive: Whether to upload to Google Drive
+        flatten_stl_structure: Whether to flatten STL folder structure in ZIP
+        cleanup_after: Whether to cleanup temp folder after processing
+        interactive: Whether to show interactive terminal display
+    
+    Returns:
+        Dictionary with processing results
+    """
+    # Suppress logger output in interactive mode for cleaner display
+    if interactive:
+        logger.setLevel(logging.CRITICAL + 1)  # Disable all logging
+        print_banner()
+    
+    results = {
+        'processed_archives': 0,
+        'total_images': 0,
+        'total_stl_files': 0,
+        'created_zips': [],
+        'uploaded_files': [],
+        'errors': []
+    }
+    
+    # Setup paths
+    source_path = Path(source_folder)
+    output_path = Path(output_folder)
+    temp_folder = output_path / "temp_extract"
+    images_folder = output_path / "Images"
+    stl_zip_folder = output_path / "STL_Zips"
+    
+    # Create output directories
+    output_path.mkdir(parents=True, exist_ok=True)
+    stl_zip_folder.mkdir(parents=True, exist_ok=True)
+    
+    total_archives = 0
+    
+    try:
+        # Step 1: Scan for archives
+        if interactive:
+            print_section("📂 STEP 1: Scanning for Archives")
+            print_status(f"Scanning folder: {source_folder}", "progress")
+        
+        archives = scan_for_archives(str(source_path))
+        total_archives = len(archives)
+        
+        if not archives:
+            if interactive:
+                print_status("No archives found to process", "warning")
+            else:
+                logger.warning("No archives found to process")
+            return results
+        
+        if interactive:
+            print_status(f"Found {total_archives} archive(s) to process", "success")
+            for i, arch in enumerate(archives, 1):
+                print(f"   {Colors.CYAN}{i}.{Colors.END} {arch.name}")
+        
+        # Authenticate with Google Drive if needed
+        drive = None
+        if upload_to_drive and GDRIVE_SUPPORT:
+            if interactive:
+                print_section("🔐 STEP 2: Google Drive Authentication")
+                print_status("Authenticating with Google Drive...", "progress")
+            try:
+                drive = authenticate_gdrive()
+                if interactive:
+                    print_status("Google Drive authentication successful!", "success")
+            except Exception as e:
+                if interactive:
+                    print_status(f"Google Drive auth failed: {e}", "warning")
+                else:
+                    logger.warning(f"Google Drive auth failed, skipping uploads: {e}")
+                results['errors'].append(f"GDrive auth failed: {e}")
+        
+        # Step 3: Process each archive
+        if interactive:
+            print_section("⚙️  STEP 3: Processing Archives")
+            print()
+        
+        for idx, archive in enumerate(archives, 1):
+            if interactive:
+                print(f"\n{Colors.BOLD}{Colors.YELLOW}📦 [{idx}/{total_archives}] Processing: {archive.name}{Colors.END}")
+                print_progress_bar(idx - 1, total_archives, prefix="  Overall Progress")
+            else:
+                logger.info(f"Processing: {archive.name}")
+            
+            try:
+                # Extract archive
+                if interactive:
+                    print_status(f"  Extracting {archive.name}...", "progress")
+                extract_dir = extract_archive(archive, temp_folder)
+                if interactive:
+                    print_status(f"  Extracted successfully", "success")
+                
+                # Get effective root to avoid Archive/Archive/Render structure
+                eff_root = get_effective_root(extract_dir)
+                if eff_root != extract_dir:
+                    logger.debug(f"  Using effective root: {eff_root.relative_to(extract_dir)}")
+                
+                # Create project-specific output folder
+                clean_project_name = clean_name(archive.stem)
+                project_folder = output_path / clean_project_name
+                project_folder.mkdir(parents=True, exist_ok=True)
+                
+                images_dest = project_folder / "Images"
+                
+                # Move images
+                if interactive:
+                    print_status(f"  Sorting images...", "progress")
+                moved_images = move_images_to_folder(
+                    eff_root, images_dest, archive.name, not flatten_stl_structure
+                )
+                results['total_images'] += len(moved_images)
+                if interactive and moved_images:
+                    print_status(f"  Found {len(moved_images)} images", "success")
+                
+                # Find STL files
+                if interactive:
+                    print_status(f"  Finding STL files...", "progress")
+                stl_files = find_stl_files(eff_root)
+                results['total_stl_files'] += len(stl_files)
+                if interactive:
+                    print_status(f"  Found {len(stl_files)} STL files", "success")
+                
+                # Create STL ZIP
+                if stl_files:
+                    if interactive:
+                        print_status(f"  Creating STL ZIP...", "progress")
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    clean_archive_stem = clean_name(archive.stem)
+                    zip_name = f"{clean_archive_stem}_STL_{timestamp}.zip"
+                    # Put ZIP inside the project folder
+                    zip_path = project_folder / zip_name
+                    
+                    created_zip = create_stl_zip(
+                        stl_files, zip_path, eff_root, flatten_stl_structure
+                    )
+                    
+                    if created_zip:
+                        results['created_zips'].append(str(created_zip))
+                        if interactive:
+                            print_status(f"  Created: {zip_name}", "success")
+                        
+                        # Upload to Google Drive
+                        if drive and upload_to_drive:
+                            try:
+                                if interactive:
+                                    print_status(f"  Uploading to Google Drive...", "upload")
+                                file_id, download_link = upload_to_gdrive(
+                                    drive, created_zip, gdrive_folder_id
+                                )
+                                results['uploaded_files'].append({
+                                    'file': zip_name,
+                                    'drive_id': file_id,
+                                    'link': download_link
+                                })
+                                
+                                # Create link file in the project folder
+                                if download_link:
+                                    create_link_file(project_folder, download_link, LINK_FILENAME)
+                                    if interactive:
+                                        print_status(f"  Link file created: {LINK_FILENAME}", "success")
+                                
+                                if interactive:
+                                    print_status(f"  Uploaded successfully!", "success")
+                                
+                                # Auto-delete local ZIP after successful upload
+                                if DELETE_AFTER_UPLOAD:
+                                    try:
+                                        created_zip.unlink()
+                                        if interactive:
+                                            print_status(f"  Local file deleted to save space", "success")
+                                    except Exception as cleanup_err:
+                                        logger.warning(f"Failed to delete local zip {created_zip}: {cleanup_err}")
+                            except Exception as e:
+                                if interactive:
+                                    print_status(f"  Upload failed: {e}", "error")
+                                else:
+                                    logger.error(f"Upload failed for {zip_name}: {e}")
+                                results['errors'].append(f"Upload failed: {zip_name}")
+                
+                results['processed_archives'] += 1
+                if interactive:
+                    print_status(f"  ✓ Archive completed successfully", "complete")
+            
+            except Exception as e:
+                if interactive:
+                    print_status(f"  Failed: {e}", "error")
+                else:
+                    logger.error(f"Failed to process {archive.name}: {e}")
+                results['errors'].append(f"Failed: {archive.name} - {e}")
+        
+        # Final progress update
+        if interactive:
+            print()
+            print_progress_bar(total_archives, total_archives, prefix="  Overall Progress")
+        
+        # Step 4: Cleanup
+        if cleanup_after:
+            if interactive:
+                print_section("🧹 STEP 4: Cleanup")
+                print_status("Cleaning up temporary files...", "progress")
+            cleanup_temp_folder(temp_folder)
+            if interactive:
+                print_status("Cleanup completed!", "success")
+    
+    except Exception as e:
+        if interactive:
+            print_status(f"Process failed: {e}", "error")
+        else:
+            logger.error(f"Process failed: {e}")
+        results['errors'].append(f"Process error: {e}")
+    
+    # Show summary
+    if interactive:
+        print_section("📊 FINAL SUMMARY")
+        print_summary_box(results, total_archives)
+    else:
+        logger.info("=" * 60)
+        logger.info("Processing Complete!")
+        logger.info(f"Archives processed: {results['processed_archives']}")
+        logger.info(f"Images extracted: {results['total_images']}")
+        logger.info(f"STL files found: {results['total_stl_files']}")
+        logger.info(f"ZIPs created: {len(results['created_zips'])}")
+        logger.info(f"Files uploaded: {len(results['uploaded_files'])}")
+        if results['errors']:
+            logger.warning(f"Errors encountered: {len(results['errors'])}")
+        logger.info("=" * 60)
+    
+    return results
+
+
+# ============================================================================
+# INTERACTIVE MENU FUNCTIONS
+# ============================================================================
+
+def get_user_input(prompt: str, default: str = "") -> str:
+    """Get user input with optional default value."""
+    if default:
+        user_input = input(f"{prompt} [{Colors.CYAN}{default}{Colors.END}]: ").strip()
+        return user_input if user_input else default
+    else:
+        return input(f"{prompt}: ").strip()
+
+
+def yes_no_prompt(prompt: str, default: bool = True) -> bool:
+    """Prompt user for yes/no question."""
+    default_str = "Y/n" if default else "y/N"
+    response = input(f"{prompt} [{Colors.CYAN}{default_str}{Colors.END}]: ").strip().lower()
+    
+    if not response:
+        return default
+    return response in ['y', 'yes', 'ya']
+
+
+def select_folder_interactive() -> Optional[str]:
+    """Interactive folder selection with browsing capability."""
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}📂 Select Source Folder{Colors.END}")
+    print(f"{Colors.CYAN}{'─' * 70}{Colors.END}")
+    
+    # Show current directory
+    current_dir = os.getcwd()
+    print(f"\n{Colors.BLUE}Current directory:{Colors.END} {current_dir}")
+    
+    # List directories in current folder
+    try:
+        dirs = [d for d in os.listdir(current_dir) if os.path.isdir(d) and not d.startswith('.')]
+        if dirs:
+            print(f"\n{Colors.GREEN}Available folders:{Colors.END}")
+            for i, d in enumerate(dirs[:10], 1):  # Show max 10
+                print(f"  {Colors.CYAN}{i}.{Colors.END} {d}")
+            if len(dirs) > 10:
+                print(f"  {Colors.YELLOW}... and {len(dirs) - 10} more{Colors.END}")
+    except Exception:
+        dirs = []
+    
+    print(f"\n{Colors.YELLOW}Options:{Colors.END}")
+    print(f"  • Enter folder path (absolute or relative)")
+    print(f"  • Enter folder name from list above")
+    print(f"  • Press Enter to use current directory")
+    print(f"  • Type 'q' to quit")
+    
+    while True:
+        folder = get_user_input(f"\n{Colors.BOLD}Folder path{Colors.END}", ".")
+        
+        if folder.lower() == 'q':
+            return None
+        
+        # Expand path
+        folder = os.path.expanduser(folder)
+        folder_path = Path(folder).resolve()
+        
+        if folder_path.exists() and folder_path.is_dir():
+            # Check if folder has archives
+            archives = list(folder_path.glob("*.zip")) + list(folder_path.glob("*.rar"))
+            if archives:
+                print(f"{Colors.GREEN}✓{Colors.END} Found {len(archives)} archive(s) in: {folder_path}")
+                return str(folder_path)
+            else:
+                print(f"{Colors.YELLOW}⚠️  No .zip or .rar files found in this folder.{Colors.END}")
+                if yes_no_prompt("Continue anyway?", False):
+                    return str(folder_path)
+        else:
+            print(f"{Colors.RED}✗ Folder not found: {folder_path}{Colors.END}")
+
+
+def interactive_configuration() -> dict:
+    """Interactive configuration menu for all options."""
+    print_banner()
+    
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'═' * 70}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.YELLOW}  ⚙️  CONFIGURATION WIZARD{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'═' * 70}{Colors.END}\n")
+    
+    config = {}
+    
+    # 1. Source folder
+    source_folder = select_folder_interactive()
+    if not source_folder:
+        print(f"\n{Colors.RED}Operation cancelled.{Colors.END}")
+        exit(0)
+    config['source_folder'] = source_folder
+    
+    # 2. Output folder
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}📁 Output Folder{Colors.END}")
+    print(f"{Colors.CYAN}{'─' * 70}{Colors.END}")
+    output_folder = get_user_input("Output folder path", "output")
+    config['output_folder'] = output_folder
+    
+    # 3. Google Drive upload
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}☁️  Google Drive Upload{Colors.END}")
+    print(f"{Colors.CYAN}{'─' * 70}{Colors.END}")
+    
+    if not GDRIVE_SUPPORT:
+        print(f"{Colors.YELLOW}⚠️  PyDrive2 not installed. Upload disabled.{Colors.END}")
+        config['upload_to_drive'] = False
+        config['gdrive_folder_id'] = None
+    else:
+        upload = yes_no_prompt("Upload to Google Drive?", True)
+        config['upload_to_drive'] = upload
+        
+        if upload:
+            folder_id = get_user_input("Google Drive folder ID (optional)", "")
+            config['gdrive_folder_id'] = folder_id if folder_id else None
+        else:
+            config['gdrive_folder_id'] = None
+    
+    # 4. Advanced options
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}🔧 Advanced Options{Colors.END}")
+    print(f"{Colors.CYAN}{'─' * 70}{Colors.END}")
+    
+    config['flatten_stl_structure'] = yes_no_prompt("Flatten STL folder structure in ZIP?", False)
+    config['cleanup_after'] = yes_no_prompt("Cleanup temporary files after processing?", True)
+    
+    # Summary
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'═' * 70}{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.YELLOW}  📋 CONFIGURATION SUMMARY{Colors.END}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'═' * 70}{Colors.END}")
+    print(f"{Colors.GREEN}Source Folder:{Colors.END}        {config['source_folder']}")
+    print(f"{Colors.GREEN}Output Folder:{Colors.END}        {config['output_folder']}")
+    print(f"{Colors.GREEN}Upload to GDrive:{Colors.END}     {'Yes' if config['upload_to_drive'] else 'No'}")
+    if config['gdrive_folder_id']:
+        print(f"{Colors.GREEN}GDrive Folder ID:{Colors.END}     {config['gdrive_folder_id']}")
+    print(f"{Colors.GREEN}Flatten Structure:{Colors.END}    {'Yes' if config['flatten_stl_structure'] else 'No'}")
+    print(f"{Colors.GREEN}Cleanup After:{Colors.END}        {'Yes' if config['cleanup_after'] else 'No'}")
+    print(f"{Colors.CYAN}{'═' * 70}{Colors.END}\n")
+    
+    if not yes_no_prompt("Start processing?", True):
+        print(f"\n{Colors.RED}Operation cancelled.{Colors.END}")
+        exit(0)
+    
+    return config
+
+
+# ============================================================================
+# CLI ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+    
+    parser = argparse.ArgumentParser(
+        description="STL File Manager - Extract, sort, and upload STL files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode (recommended)
+  python stl_manager.py
+  
+  # Direct mode with arguments
+  python stl_manager.py ./archives
+  python stl_manager.py ./archives -o ./output --no-upload
+  python stl_manager.py ./archives --gdrive-folder 1ABC123xyz
+        """
+    )
+    
+    parser.add_argument(
+        "source_folder",
+        nargs='?',  # Make it optional
+        help="Folder containing .zip/.rar files to process"
+    )
+    
+    parser.add_argument(
+        "-o", "--output",
+        default="output",
+        help="Output folder for processed files (default: output)"
+    )
+    
+    parser.add_argument(
+        "--gdrive-folder",
+        help="Google Drive folder ID for uploads"
+    )
+    
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Skip Google Drive upload"
+    )
+    
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Skip cleanup of temporary files"
+    )
+    
+    parser.add_argument(
+        "--flatten",
+        action="store_true",
+        help="Flatten folder structure in STL ZIP (default: preserve structure)"
+    )
+    
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose (debug) logging"
+    )
+    
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Disable interactive terminal display (use logging instead)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Update logging level if verbose
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        for handler in logger.handlers:
+            handler.setLevel(logging.DEBUG)
+    
+    # Determine if we should use interactive mode
+    if args.source_folder:
+        # CLI mode with arguments
+        source_folder = args.source_folder
+        output_folder = args.output
+        gdrive_folder_id = args.gdrive_folder
+        upload_to_drive = not args.no_upload
+        flatten_stl_structure = args.flatten
+        cleanup_after = not args.no_cleanup
+        interactive = not args.non_interactive
+    else:
+        # Interactive configuration mode
+        config = interactive_configuration()
+        source_folder = config['source_folder']
+        output_folder = config['output_folder']
+        gdrive_folder_id = config['gdrive_folder_id']
+        upload_to_drive = config['upload_to_drive']
+        flatten_stl_structure = config['flatten_stl_structure']
+        cleanup_after = config['cleanup_after']
+        interactive = True
+    
+    # Run the process
+    results = process_archives(
+        source_folder=source_folder,
+        output_folder=output_folder,
+        gdrive_folder_id=gdrive_folder_id,
+        upload_to_drive=upload_to_drive,
+        flatten_stl_structure=flatten_stl_structure,
+        cleanup_after=cleanup_after,
+        interactive=interactive
+    )
+    
+    # Exit with error code if there were failures
+    if results['errors']:
+        exit(1)

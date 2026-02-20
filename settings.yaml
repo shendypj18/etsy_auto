@@ -1,0 +1,18 @@
+# PyDrive2 Settings Configuration
+# ================================
+
+# Client secrets configuration
+client_config_backend: file
+client_config_file: client_secrets.json
+
+# Credential saving settings
+save_credentials: True
+save_credentials_backend: file
+save_credentials_file: gdrive_credentials.json
+
+# Get refresh token to avoid re-authentication
+get_refresh_token: True
+
+# OAuth scopes - only request what we need
+oauth_scope:
+  - https://www.googleapis.com/auth/drive.file
