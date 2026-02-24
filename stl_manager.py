@@ -57,6 +57,12 @@ except ImportError:
 
 # Import helper functions
 from gdrive_handler import create_link_file
+try:
+    import watermark_remover
+    WATERMARK_REMOVAL_SUPPORT = True
+except ImportError as e:
+    WATERMARK_REMOVAL_SUPPORT = False
+    logging.warning(f"Watermark remover module not fully available: {e}. Watermark removal will be skipped.")
 
 # ============================================================================
 # SCRIPT METADATA
@@ -133,6 +139,7 @@ def print_banner():
 ║  {Colors.END}  ✓ Sort images (.jpg, .png, .jpeg, .webp)                        {Colors.CYAN}║
 ║  {Colors.END}  ✓ Extract & recompress STL files                               {Colors.CYAN}║
 ║  {Colors.END}  ✓ Upload to Google Drive via PyDrive2                          {Colors.CYAN}║
+║  {Colors.END}  ✓ Auto watermark removal (M1/MPS optimized)                    {Colors.CYAN}║
 ║  {Colors.END}  ✓ Automatic cleanup of temp files                              {Colors.CYAN}║
 ╚══════════════════════════════════════════════════════════════════════╝
 {Colors.END}"""
@@ -779,6 +786,7 @@ def process_archives(
     output_folder: str = "output",
     gdrive_folder_id: Optional[str] = None,
     upload_to_drive: bool = True,
+    remove_watermarks: bool = True,
     flatten_stl_structure: bool = True,
     cleanup_after: bool = True,
     interactive: bool = True
@@ -791,6 +799,7 @@ def process_archives(
         output_folder: Folder for output files (Images, STL zips)
         gdrive_folder_id: Optional Google Drive folder ID for uploads
         upload_to_drive: Whether to upload to Google Drive
+        remove_watermarks: Whether to automatically detect and remove watermarks
         flatten_stl_structure: Whether to flatten STL folder structure in ZIP
         cleanup_after: Whether to cleanup temp folder after processing
         interactive: Whether to show interactive terminal display
@@ -997,6 +1006,29 @@ def process_archives(
                 results['total_images'] += len(moved_images)
                 if interactive and moved_images:
                     print_status(f"  Found {len(moved_images)} images", "success")
+                
+                # Process Watermarks
+                if remove_watermarks and WATERMARK_REMOVAL_SUPPORT and moved_images:
+                    if interactive:
+                        print_status(f"  Scanning and cleaning watermarks...", "progress")
+                    
+                    # We process the specific archive's images folder
+                    archive_images_dir = images_dest / clean_name(archive.stem)
+                    
+                    try:
+                        num_cleaned = watermark_remover.process_watermarks(archive_images_dir)
+                        if num_cleaned > 0:
+                            if interactive:
+                                print_status(f"  Cleaned watermarks from {num_cleaned} image(s)", "clean")
+                            else:
+                                logger.info(f"Cleaned watermarks from {num_cleaned} image(s)")
+                        elif interactive:
+                            print_status(f"  No watermarks found or processed", "info")
+                    except Exception as wm_err:
+                        if interactive:
+                            print_status(f"  Watermark removal failed: {wm_err}", "warning")
+                        else:
+                            logger.warning(f"Watermark removal failed: {wm_err}")
                 
                 # Find STL files
                 if interactive:
@@ -1229,7 +1261,17 @@ def interactive_configuration() -> dict:
         else:
             config['gdrive_folder_id'] = None
     
-    # 4. Advanced options
+    # 4. Watermark Removal
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}🪄  Watermark Removal{Colors.END}")
+    print(f"{Colors.CYAN}{'─' * 70}{Colors.END}")
+    
+    if not WATERMARK_REMOVAL_SUPPORT:
+        print(f"{Colors.YELLOW}⚠️  Watermark remover dependencies not installed. Skipped.{Colors.END}")
+        config['remove_watermarks'] = False
+    else:
+        config['remove_watermarks'] = yes_no_prompt("Automatically remove watermarks from images?", True)
+    
+    #. 5 Advanced options
     print(f"\n{Colors.BOLD}{Colors.YELLOW}🔧 Advanced Options{Colors.END}")
     print(f"{Colors.CYAN}{'─' * 70}{Colors.END}")
     
@@ -1245,6 +1287,7 @@ def interactive_configuration() -> dict:
     print(f"{Colors.GREEN}Upload to GDrive:{Colors.END}     {'Yes' if config['upload_to_drive'] else 'No'}")
     if config['gdrive_folder_id']:
         print(f"{Colors.GREEN}GDrive Folder ID:{Colors.END}     {config['gdrive_folder_id']}")
+    print(f"{Colors.GREEN}Remove Watermarks:{Colors.END}    {'Yes' if config['remove_watermarks'] else 'No'}")
     print(f"{Colors.GREEN}Flatten Structure:{Colors.END}    {'Yes' if config['flatten_stl_structure'] else 'No'}")
     print(f"{Colors.GREEN}Cleanup After:{Colors.END}        {'Yes' if config['cleanup_after'] else 'No'}")
     print(f"{Colors.CYAN}{'═' * 70}{Colors.END}\n")
@@ -1303,6 +1346,12 @@ Examples:
     )
     
     parser.add_argument(
+        "--no-watermark",
+        action="store_true",
+        help="Skip automatic watermark removal for images"
+    )
+    
+    parser.add_argument(
         "--no-cleanup",
         action="store_true",
         help="Skip cleanup of temporary files"
@@ -1341,6 +1390,7 @@ Examples:
         output_folder = args.output
         gdrive_folder_id = args.gdrive_folder
         upload_to_drive = not args.no_upload
+        remove_watermarks = not args.no_watermark
         flatten_stl_structure = args.flatten
         cleanup_after = not args.no_cleanup
         interactive = not args.non_interactive
@@ -1351,6 +1401,7 @@ Examples:
         output_folder = config['output_folder']
         gdrive_folder_id = config['gdrive_folder_id']
         upload_to_drive = config['upload_to_drive']
+        remove_watermarks = config['remove_watermarks']
         flatten_stl_structure = config['flatten_stl_structure']
         cleanup_after = config['cleanup_after']
         interactive = True
@@ -1361,6 +1412,7 @@ Examples:
         output_folder=output_folder,
         gdrive_folder_id=gdrive_folder_id,
         upload_to_drive=upload_to_drive,
+        remove_watermarks=remove_watermarks,
         flatten_stl_structure=flatten_stl_structure,
         cleanup_after=cleanup_after,
         interactive=interactive
