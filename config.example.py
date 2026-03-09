@@ -60,7 +60,18 @@ GDRIVE_TOKEN_FILE = BASE_DIR / "gdrive_credentials.json"
 # Target folder ID in Google Drive (optional)
 # Leave as None to upload to root
 # Get ID from folder URL: drive.google.com/drive/folders/FOLDER_ID_HERE
-GDRIVE_FOLDER_ID = None
+GDRIVE_FOLDER_ID = None  # Or use "1ABC123xyz..."
+
+# ============================================================================
+# GEMINI AI CONFIGURATION
+# ============================================================================
+
+# Get your API key from Google AI Studio (https://aistudio.google.com/)
+# Set to "your_google_gemini_api_key_here" if not using AI.
+GEMINI_API_KEY = "your_google_gemini_api_key_here"
+
+# Enable automatic generation of description.txt based on images
+GENERATE_AI_DESCRIPTION = True
 
 # ============================================================================
 # PROCESSING OPTIONS

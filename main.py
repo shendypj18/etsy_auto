@@ -60,6 +60,13 @@ except ImportError:
     PYDRIVE_AVAILABLE = False
 
 try:
+    import ai_generator
+    AI_GENERATOR_SUPPORT = True
+except ImportError as e:
+    AI_GENERATOR_SUPPORT = False
+    logger.warning(f"AI generator module not fully available: {e}. AI description generation will be skipped.")
+
+try:
     import rarfile
     RAR_SUPPORT = True
 except ImportError:
@@ -275,6 +282,18 @@ class FileProcessor:
                             dest = dest.parent / f"{stem}_{counter}{suffix}"
                             counter += 1
                     shutil.move(str(img), str(dest))
+            
+            # Step 3.5: AI Description Generation
+            if AI_GENERATOR_SUPPORT and images:
+                logger.info(f"{Colors.BLUE}🤖 Generating AI description...{Colors.END}")
+                character_name = self._clean_name(archive_path.stem)
+                
+                try:
+                    ai_success = ai_generator.create_description_file(character_name, folder_a / "Images", folder_a)
+                    if ai_success:
+                        logger.info(f"{Colors.GREEN}✓ AI description created in {folder_a.name}{Colors.END}")
+                except Exception as ai_err:
+                    logger.warning(f"{Colors.YELLOW}⚠️ AI generation failed: {ai_err}{Colors.END}")
             
             # Step 4: Create STL ZIP (models_only.zip)
             stl_zip_path = None

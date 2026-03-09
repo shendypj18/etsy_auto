@@ -64,6 +64,13 @@ except ImportError as e:
     WATERMARK_REMOVAL_SUPPORT = False
     logging.warning(f"Watermark remover module not fully available: {e}. Watermark removal will be skipped.")
 
+try:
+    import ai_generator
+    AI_GENERATOR_SUPPORT = True
+except ImportError as e:
+    AI_GENERATOR_SUPPORT = False
+    logging.warning(f"AI generator module not fully available: {e}. AI description generation will be skipped.")
+
 # ============================================================================
 # SCRIPT METADATA
 # ============================================================================
@@ -140,6 +147,7 @@ def print_banner():
 ║  {Colors.END}  ✓ Extract & recompress STL files                               {Colors.CYAN}║
 ║  {Colors.END}  ✓ Upload to Google Drive via PyDrive2                          {Colors.CYAN}║
 ║  {Colors.END}  ✓ Auto watermark removal (M1/MPS optimized)                    {Colors.CYAN}║
+║  {Colors.END}  ✓ Auto-generate Etsy listings (Gemini AI Vision)               {Colors.CYAN}║
 ║  {Colors.END}  ✓ Automatic cleanup of temp files                              {Colors.CYAN}║
 ╚══════════════════════════════════════════════════════════════════════╝
 {Colors.END}"""
@@ -241,6 +249,7 @@ def print_summary_box(results: dict, total_archives: int):
 {Colors.CYAN}║{Colors.END}  🔧 STL Files Found:  {results['total_stl_files']:<48}{Colors.CYAN}║{Colors.END}
 {Colors.CYAN}║{Colors.END}  📁 ZIPs Created:     {len(results['created_zips']):<48}{Colors.CYAN}║{Colors.END}
 {Colors.CYAN}║{Colors.END}  ☁️  Files Uploaded:   {len(results['uploaded_files']):<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  🤖 AI Descriptions:  {results.get('ai_descriptions', 0):<48}{Colors.CYAN}║{Colors.END}
 {Colors.CYAN}╚══════════════════════════════════════════════════════════════════════╝{Colors.END}
 """)
     
@@ -1029,6 +1038,30 @@ def process_archives(
                             print_status(f"  Watermark removal failed: {wm_err}", "warning")
                         else:
                             logger.warning(f"Watermark removal failed: {wm_err}")
+                
+                # Generate AI Description
+                if AI_GENERATOR_SUPPORT and moved_images:
+                    if interactive:
+                        print_status(f"  Generating AI description...", "progress")
+                    
+                    archive_images_dir = images_dest / clean_name(archive.stem)
+                    character_name = clean_name(archive.stem)
+                    
+                    try:
+                        ai_success = ai_generator.create_description_file(character_name, archive_images_dir, project_folder)
+                        if ai_success:
+                            results['ai_descriptions'] = results.get('ai_descriptions', 0) + 1
+                            if interactive:
+                                print_status(f"  AI description created in {project_folder.name}", "success")
+                            else:
+                                logger.info(f"AI description created in {project_folder.name}")
+                        elif interactive:
+                            print_status(f"  AI description generation skipped or failed", "info")
+                    except Exception as ai_err:
+                        if interactive:
+                            print_status(f"  AI generation failed: {ai_err}", "warning")
+                        else:
+                            logger.warning(f"AI generation failed: {ai_err}")
                 
                 # Find STL files
                 if interactive:
