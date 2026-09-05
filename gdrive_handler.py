@@ -28,6 +28,7 @@ except ImportError:
 # Import config
 try:
     from config import (
+        BASE_DIR,
         GDRIVE_AUTH_METHOD,
         GDRIVE_CREDENTIALS_FILE,
         GDRIVE_TOKEN_FILE,
@@ -38,9 +39,10 @@ try:
     )
 except ImportError:
     # Fallback defaults
+    BASE_DIR = Path(__file__).parent.resolve()
     GDRIVE_AUTH_METHOD = "oauth"
-    GDRIVE_CREDENTIALS_FILE = Path("client_secrets.json")
-    GDRIVE_TOKEN_FILE = Path("gdrive_credentials.json")
+    GDRIVE_CREDENTIALS_FILE = BASE_DIR / "client_secrets.json"
+    GDRIVE_TOKEN_FILE = BASE_DIR / "gdrive_credentials.json"
     GDRIVE_FOLDER_ID = None
     MAX_UPLOAD_RETRIES = 3
     RETRY_DELAY = 5
@@ -133,8 +135,17 @@ class GDriveHandler:
         logger.info("Authenticating with Google Drive...")
         
         try:
-            self.gauth = GoogleAuth()
+            settings_path = BASE_DIR / "settings.yaml"
+            if settings_path.exists():
+                self.gauth = GoogleAuth(settings_file=str(settings_path))
+            else:
+                self.gauth = GoogleAuth()
             
+            if self.credentials_file:
+                self.gauth.settings['client_config_file'] = str(self.credentials_file)
+            if self.token_file:
+                self.gauth.settings['save_credentials_file'] = str(self.token_file)
+
             if self.auth_method == "service_account":
                 # Service Account authentication
                 self._auth_service_account()

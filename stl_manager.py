@@ -20,6 +20,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
 
+BASE_DIR = Path(__file__).parent.resolve()
+
 try:
     import rarfile
     RAR_SUPPORT = True
@@ -608,7 +610,7 @@ def create_stl_zip(
 # GOOGLE DRIVE UPLOAD FUNCTIONS
 # ============================================================================
 
-def authenticate_gdrive(client_secrets_path: str = "client_secrets.json"):
+def authenticate_gdrive(client_secrets_path: Optional[str] = None):
     """
     Authenticate with Google Drive using client_secrets.json.
     
@@ -623,17 +625,30 @@ def authenticate_gdrive(client_secrets_path: str = "client_secrets.json"):
     
     logger.info("Authenticating with Google Drive...")
     
+    if client_secrets_path is None:
+        client_secrets_path = str(BASE_DIR / "client_secrets.json")
+    
     if not os.path.exists(client_secrets_path):
         raise FileNotFoundError(
             f"client_secrets.json not found at: {client_secrets_path}\n"
             "Please follow the setup instructions in SETUP_GUIDE.md"
         )
     
+    cred_file = str(BASE_DIR / "gdrive_credentials.json")
+    settings_file = BASE_DIR / "settings.yaml"
+
     try:
-        gauth = GoogleAuth()
+        if settings_file.exists():
+            gauth = GoogleAuth(settings_file=str(settings_file))
+        else:
+            gauth = GoogleAuth()
+            
+        gauth.settings['client_config_file'] = client_secrets_path
+        gauth.settings['save_credentials_file'] = cred_file
         
         # Try to load saved credentials
-        gauth.LoadCredentialsFile("gdrive_credentials.json")
+        if os.path.exists(cred_file):
+            gauth.LoadCredentialsFile(cred_file)
         
         if gauth.credentials is None:
             # Authenticate if no credentials found
@@ -644,14 +659,15 @@ def authenticate_gdrive(client_secrets_path: str = "client_secrets.json"):
                 gauth.Refresh()
             except Exception:
                 logger.warning("Token refresh failed, re-authenticating...")
-                os.remove("gdrive_credentials.json")
+                if os.path.exists(cred_file):
+                    os.remove(cred_file)
                 gauth.LocalWebserverAuth()
         else:
             # Authorize with valid credentials
             gauth.Authorize()
         
         # Save credentials for next run
-        gauth.SaveCredentialsFile("gdrive_credentials.json")
+        gauth.SaveCredentialsFile(cred_file)
         
         drive = GoogleDrive(gauth)
         logger.info("Successfully authenticated with Google Drive")
@@ -888,7 +904,7 @@ def process_archives(
                         if choice == "1":
                             try:
                                 # Delete old credentials and retry
-                                cred_file = "gdrive_credentials.json"
+                                cred_file = str(BASE_DIR / "gdrive_credentials.json")
                                 if os.path.exists(cred_file):
                                     os.remove(cred_file)
                                     print_status("Old credentials removed", "clean")
@@ -1023,6 +1039,10 @@ def process_archives(
                     
                     # We process the specific archive's images folder
                     archive_images_dir = images_dest / clean_name(archive.stem)
+                    if not archive_images_dir.exists():
+                        archive_images_dir = images_dest / Path(archive.name).stem
+                    if not archive_images_dir.exists():
+                        archive_images_dir = images_dest
                     
                     try:
                         num_cleaned = watermark_remover.process_watermarks(archive_images_dir)
@@ -1045,6 +1065,10 @@ def process_archives(
                         print_status(f"  Generating AI description...", "progress")
                     
                     archive_images_dir = images_dest / clean_name(archive.stem)
+                    if not archive_images_dir.exists():
+                        archive_images_dir = images_dest / Path(archive.name).stem
+                    if not archive_images_dir.exists():
+                        archive_images_dir = images_dest
                     character_name = clean_name(archive.stem)
                     
                     try:
