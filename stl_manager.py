@@ -16,9 +16,12 @@ import sys
 import shutil
 import zipfile
 import logging
+import re
+import difflib
+from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple, Any, Dict
 
 BASE_DIR = Path(__file__).parent.resolve()
 
@@ -105,6 +108,127 @@ def clean_name(text: str, patterns: List[str] = CLEAN_PATTERNS) -> str:
         cleaned = cleaned.replace(" – – ", " – ")
         
     return cleaned.strip()
+
+
+def extract_base_title(text: str, patterns: List[str] = CLEAN_PATTERNS) -> str:
+    """
+    Extract the core project/model name by stripping studio prefixes,
+    variant tags, part numbers, and brackets.
+    """
+    if not text:
+        return ""
+    
+    stem = Path(text).stem if ("." in text) else text
+    
+    # 1. Clean explicit blacklist / clean patterns
+    cleaned = stem
+    for pattern in patterns:
+        cleaned = cleaned.replace(pattern, "")
+    
+    # 2. Replace underscores with spaces for uniform comparison
+    cleaned = cleaned.replace('_', ' ')
+    
+    # 3. Strip variant patterns inside parentheses/brackets
+    # e.g., (One Piece), [X Pose], (Non Cut), (Cut), (Images), (Render), (Size...), (Part 1)
+    var_regex = r'\s*[\(\[\{](?:one\s*piece|x\s*pose|non\s*cut|uncut|cut(?:\s*parts?)?|images?|renders?|photos?|size.*?|parts?|pose\s*[a-z0-9]|scale.*?|pre-?supported|unsupported|stl|18\+?|nsfw)[\)\]\}]'
+    cleaned = re.sub(var_regex, '', cleaned, flags=re.IGNORECASE)
+    
+    # 4. Strip part numbers like "Part 1", "pt 2", "cd 1", "vol 1"
+    part_regex = r'\s*[-_]?\s*(?:part|pt|cd|vol|volume)\s*[-_]?\s*\d+'
+    cleaned = re.sub(part_regex, '', cleaned, flags=re.IGNORECASE)
+    
+    # 5. Strip any remaining trailing brackets if present
+    cleaned = re.sub(r'\s*[\(\[\{].*?[\)\]\}]$', '', cleaned)
+    
+    # 6. Normalize spaces and hyphens
+    cleaned = re.sub(r'\s*-\s*', ' - ', cleaned)
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    cleaned = " ".join(cleaned.split()).strip(" -_")
+    
+    return cleaned
+
+
+def extract_variant_info(filename: str, base_title: Optional[str] = None) -> Tuple[str, bool]:
+    """
+    Extract variant label from filename and determine if it is an image-only archive.
+    
+    Returns:
+        tuple (variant_name: str, is_image_archive: bool)
+    """
+    stem = Path(filename).stem
+    
+    # Check if archive is dedicated to images/renders
+    img_pattern = r'[\(\[\{_\-\s](?:images?|renders?|photos?)[\)\]\}_\-\s]?$'
+    is_image_archive = bool(re.search(img_pattern, stem, re.IGNORECASE))
+    
+    # 1. Look for brackets e.g. (One Piece), [X Pose], (Non Cut)
+    bracket_match = re.search(r'[\(\[\{]([^\)\]\}]+)[\)\]\}]', stem)
+    if bracket_match:
+        variant_raw = bracket_match.group(1).strip()
+        return variant_raw, is_image_archive
+    
+    # 2. Look for Part/CD/Vol pattern
+    part_match = re.search(r'(?:part|pt|cd|vol|volume)\s*[-_]?\s*\d+', stem, re.IGNORECASE)
+    if part_match:
+        return part_match.group(0).strip().title(), is_image_archive
+        
+    # 3. If base_title provided, inspect the suffix after base_title
+    if base_title:
+        norm_stem = stem.replace('_', ' ')
+        norm_base = base_title.replace('_', ' ')
+        if norm_base.lower() in norm_stem.lower():
+            idx = norm_stem.lower().find(norm_base.lower())
+            suffix = norm_stem[idx + len(norm_base):].strip(' -_()[]{}')
+            if suffix:
+                return suffix.title(), is_image_archive
+    
+    return "Complete Model", is_image_archive
+
+
+def group_archives_by_project(archive_paths: List[Path]) -> Dict[str, List[Path]]:
+    """
+    Intelligently cluster archive paths into project groups.
+    Archives with identical or highly similar base titles are grouped together.
+    """
+    groups: Dict[str, List[Path]] = OrderedDict()
+    
+    def titles_match(t1: str, t2: str) -> bool:
+        if t1.lower() == t2.lower():
+            return True
+        s1 = t1.lower().replace('-', '').replace('_', '')
+        s2 = t2.lower().replace('-', '').replace('_', '')
+        words1 = set(s1.split())
+        words2 = set(s2.split())
+        if not words1 or not words2:
+            return False
+        intersection = words1.intersection(words2)
+        overlap = len(intersection) / min(len(words1), len(words2))
+        if overlap >= 0.75:
+            return True
+        return difflib.SequenceMatcher(None, s1, s2).ratio() >= 0.82
+
+    for archive in archive_paths:
+        base_title = extract_base_title(archive.name)
+        if not base_title:
+            base_title = clean_name(archive.stem)
+            
+        matched_key = None
+        for existing_title in groups.keys():
+            if titles_match(base_title, existing_title):
+                matched_key = existing_title
+                break
+                
+        if matched_key:
+            groups[matched_key].append(archive)
+            # Prefer longer, more descriptive title if current one has more detail
+            if len(base_title) > len(matched_key) and " - " in base_title and " - " not in matched_key:
+                val = groups.pop(matched_key)
+                groups[base_title] = val
+        else:
+            groups[base_title] = [archive]
+            
+    return groups
 
 
 # ============================================================================
@@ -222,6 +346,8 @@ def print_summary_box(results: dict, total_archives: int):
     """Print a summary box with processing results."""
     success = results['processed_archives']
     failed = len(results['errors'])
+    total_projects = results.get('total_projects', 0)
+    processed_projects = results.get('processed_projects', 0)
     
     # Determine overall status color
     if failed == 0 and success > 0:
@@ -237,14 +363,17 @@ def print_summary_box(results: dict, total_archives: int):
         status_text = "PARTIAL"
         status_icon = "⚠️"
     
+    archive_info = f"{total_archives} ({total_projects} projects)" if total_projects else f"{total_archives}"
+    processed_info = f"{success} ({processed_projects} projects)" if total_projects else f"{success}"
+    
     print(f"""
 {Colors.CYAN}╔══════════════════════════════════════════════════════════════════════╗
 ║{Colors.BOLD}                        📊 PROCESSING SUMMARY                         {Colors.CYAN}║
 ╠══════════════════════════════════════════════════════════════════════╣{Colors.END}
 {Colors.CYAN}║{Colors.END}  Status:             {status_color}{status_icon} {status_text:<50}{Colors.CYAN}║{Colors.END}
 {Colors.CYAN}╠══════════════════════════════════════════════════════════════════════╣{Colors.END}
-{Colors.CYAN}║{Colors.END}  📦 Total Archives:   {total_archives:<48}{Colors.CYAN}║{Colors.END}
-{Colors.CYAN}║{Colors.END}  {Colors.GREEN}✅ Processed:{Colors.END}        {success:<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  📦 Total Archives:   {archive_info:<48}{Colors.CYAN}║{Colors.END}
+{Colors.CYAN}║{Colors.END}  {Colors.GREEN}✅ Processed:{Colors.END}        {processed_info:<48}{Colors.CYAN}║{Colors.END}
 {Colors.CYAN}║{Colors.END}  {Colors.RED}❌ Failed:{Colors.END}           {failed:<48}{Colors.CYAN}║{Colors.END}
 {Colors.CYAN}╠══════════════════════════════════════════════════════════════════════╣{Colors.END}
 {Colors.CYAN}║{Colors.END}  🖼️  Images Extracted: {results['total_images']:<47}{Colors.CYAN}║{Colors.END}
@@ -560,19 +689,21 @@ def find_stl_files(extract_dir: Path) -> List[Path]:
 # ============================================================================
 
 def create_stl_zip(
-    stl_files: List[Path], 
+    stl_files: List[Any], 
     output_path: Path, 
-    root_path: Path,
-    flatten_structure: bool = False
+    root_path: Optional[Path] = None,
+    flatten_structure: bool = False,
+    multi_variant: bool = False
 ) -> Optional[Path]:
     """
     Create a new ZIP file containing only STL files.
     
     Args:
-        stl_files: List of STL file paths
+        stl_files: List of STL file paths, or list of tuples (file_path, eff_root, variant_name)
         output_path: Path for the output ZIP file
-        root_path: Root path to calculate relative paths from
+        root_path: Root path to calculate relative paths from (if entries are Paths)
         flatten_structure: If True, flatten folder structure in ZIP
+        multi_variant: If True, prepend variant name to the relative path in ZIP
     
     Returns:
         Path to the created ZIP file, or None if no files to zip
@@ -585,15 +716,26 @@ def create_stl_zip(
     
     try:
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for stl_file in stl_files:
-                if flatten_structure:
-                    # Store with just the filename (flattened + cleaned)
-                    arcname = clean_name(stl_file.name)
+            for item in stl_files:
+                if isinstance(item, tuple):
+                    stl_file, eff_root, variant = item
+                    clean_variant = clean_name(variant)
+                    if flatten_structure:
+                        arcname = f"{clean_variant}/{clean_name(stl_file.name)}" if multi_variant else clean_name(stl_file.name)
+                    else:
+                        rel_parts = stl_file.relative_to(eff_root).parts
+                        cleaned_parts = [clean_name(p) for p in rel_parts]
+                        inner_path = os.path.join(*cleaned_parts)
+                        arcname = f"{clean_variant}/{inner_path}" if multi_variant else inner_path
                 else:
-                    # Preserve structure relative to root_path + cleaned folders
-                    rel_parts = stl_file.relative_to(root_path).parts
-                    cleaned_parts = [clean_name(p) for p in rel_parts]
-                    arcname = os.path.join(*cleaned_parts)
+                    stl_file = item
+                    eff_root = root_path or stl_file.parent
+                    if flatten_structure:
+                        arcname = clean_name(stl_file.name)
+                    else:
+                        rel_parts = stl_file.relative_to(eff_root).parts
+                        cleaned_parts = [clean_name(p) for p in rel_parts]
+                        arcname = os.path.join(*cleaned_parts)
                 
                 zipf.write(stl_file, arcname)
                 logger.debug(f"Added to ZIP: {arcname}")
@@ -875,10 +1017,20 @@ def process_archives(
                 logger.warning("No archives found to process")
             return results
         
+        # Intelligently group archives into project releases
+        project_groups = group_archives_by_project(archives)
+        total_projects = len(project_groups)
+        results['total_projects'] = total_projects
+        results['processed_projects'] = 0
+        
         if interactive:
-            print_status(f"Found {total_archives} archive(s) to process", "success")
-            for i, arch in enumerate(archives, 1):
-                print(f"   {Colors.CYAN}{i}.{Colors.END} {arch.name}")
+            print_status(f"Found {total_archives} archive(s) across {total_projects} project group(s)", "success")
+            for p_idx, (p_name, p_archs) in enumerate(project_groups.items(), 1):
+                print(f"   {Colors.CYAN}{p_idx}.{Colors.END} {Colors.BOLD}{p_name}{Colors.END} ({len(p_archs)} file(s))")
+                for a in p_archs:
+                    v_name, is_img = extract_variant_info(a.name, p_name)
+                    tag = "[Images Only]" if is_img else f"[{v_name}]"
+                    print(f"      • {a.name} {Colors.YELLOW}{tag}{Colors.END}")
         
         # Authenticate with Google Drive if needed
         drive = None
@@ -930,30 +1082,30 @@ def process_archives(
                     upload_to_drive = False
                 results['errors'].append(f"GDrive auth failed: {e}")
         
-        # Step 3: Process each archive
+        # Step 3: Process each project group
         if interactive:
-            print_section("⚙️  STEP 3: Processing Archives")
+            print_section("⚙️  STEP 3: Processing Project Groups")
             print()
         
-        for idx, archive in enumerate(archives, 1):
-            if interactive:
-                print(f"\n{Colors.BOLD}{Colors.YELLOW}📦 [{idx}/{total_archives}] Processing: {archive.name}{Colors.END}")
-                print_progress_bar(idx - 1, total_archives, prefix="  Overall Progress")
-            else:
-                logger.info(f"Processing: {archive.name}")
-            
-            # --- Resume logic: skip already processed archives ---
-            clean_project_name = clean_name(archive.stem)
+        for p_idx, (project_name, p_archives) in enumerate(project_groups.items(), 1):
+            clean_project_name = clean_name(project_name)
             project_folder = output_path / clean_project_name
             link_file = project_folder / LINK_FILENAME
             
-            # Check if fully processed (link file exists = extracted + zipped + uploaded)
+            if interactive:
+                print(f"\n{Colors.BOLD}{Colors.YELLOW}📦 [{p_idx}/{total_projects}] Project: {clean_project_name} ({len(p_archives)} archive(s)){Colors.END}")
+                print_progress_bar(p_idx - 1, total_projects, prefix="  Overall Progress")
+            else:
+                logger.info(f"Processing Project: {clean_project_name} ({len(p_archives)} archive(s))")
+            
+            # --- Resume logic: skip already processed project ---
             if link_file.exists():
                 if interactive:
                     print_status(f"  Already processed & uploaded — skipping", "success")
                 else:
-                    logger.info(f"Skipping (already done): {archive.name}")
-                results['processed_archives'] += 1
+                    logger.info(f"Skipping (already done): {clean_project_name}")
+                results['processed_archives'] += len(p_archives)
+                results['processed_projects'] = results.get('processed_projects', 0) + 1
                 continue
             
             # Check if ZIP exists but upload was not completed
@@ -962,7 +1114,7 @@ def process_archives(
                 if interactive:
                     print_status(f"  ZIP already exists — resuming upload only", "warning")
                 else:
-                    logger.info(f"Resuming upload for: {archive.name}")
+                    logger.info(f"Resuming upload for: {clean_project_name}")
                 
                 for existing_zip in existing_zips:
                     try:
@@ -1000,52 +1152,60 @@ def process_archives(
                             logger.error(f"Upload failed for {existing_zip.name}: {e}")
                         results['errors'].append(f"Upload failed: {existing_zip.name}")
                 
-                results['processed_archives'] += 1
+                results['processed_archives'] += len(p_archives)
+                results['processed_projects'] = results.get('processed_projects', 0) + 1
                 continue
             # --- End resume logic ---
             
             try:
-                # Extract archive
-                if interactive:
-                    print_status(f"  Extracting {archive.name}...", "progress")
-                extract_dir = extract_archive(archive, temp_folder)
-                if interactive:
-                    print_status(f"  Extracted successfully", "success")
-                
-                # Get effective root to avoid Archive/Archive/Render structure
-                eff_root = get_effective_root(extract_dir)
-                if eff_root != extract_dir:
-                    logger.debug(f"  Using effective root: {eff_root.relative_to(extract_dir)}")
-                
-                # Create project-specific output folder
+                # Create project-specific output folders
                 project_folder.mkdir(parents=True, exist_ok=True)
-                
                 images_dest = project_folder / "Images"
+                images_dest.mkdir(parents=True, exist_ok=True)
                 
-                # Move images
+                all_stl_entries = []
+                all_moved_images = []
+                
+                # Check how many archives have model files (excluding pure image archives)
+                model_archives = [a for a in p_archives if not extract_variant_info(a.name, project_name)[1]]
+                is_multi_variant = len(model_archives) > 1
+                
+                # Extract and aggregate each archive in the group
+                for a_idx, archive in enumerate(p_archives, 1):
+                    if interactive:
+                        print_status(f"  Extracting [{a_idx}/{len(p_archives)}] {archive.name}...", "progress")
+                    
+                    extract_dir = extract_archive(archive, temp_folder)
+                    eff_root = get_effective_root(extract_dir)
+                    variant_name, is_img_only = extract_variant_info(archive.name, project_name)
+                    
+                    # Move images to unified project Images folder
+                    moved_images = move_images_to_folder(
+                        eff_root, images_dest, archive.name, not flatten_stl_structure
+                    )
+                    all_moved_images.extend(moved_images)
+                    
+                    # Find model files if not pure image archive
+                    if not is_img_only:
+                        stl_files = find_stl_files(eff_root)
+                        for stl in stl_files:
+                            all_stl_entries.append((stl, eff_root, variant_name))
+                            
+                    results['processed_archives'] += 1
+                
+                results['total_images'] += len(all_moved_images)
+                results['total_stl_files'] += len(all_stl_entries)
+                
                 if interactive:
-                    print_status(f"  Sorting images...", "progress")
-                moved_images = move_images_to_folder(
-                    eff_root, images_dest, archive.name, not flatten_stl_structure
-                )
-                results['total_images'] += len(moved_images)
-                if interactive and moved_images:
-                    print_status(f"  Found {len(moved_images)} images", "success")
+                    print_status(f"  Aggregated {len(all_moved_images)} image(s) and {len(all_stl_entries)} model file(s)", "success")
                 
-                # Process Watermarks
-                if remove_watermarks and WATERMARK_REMOVAL_SUPPORT and moved_images:
+                # Process Watermarks once per project
+                if remove_watermarks and WATERMARK_REMOVAL_SUPPORT and all_moved_images:
                     if interactive:
                         print_status(f"  Scanning and cleaning watermarks...", "progress")
                     
-                    # We process the specific archive's images folder
-                    archive_images_dir = images_dest / clean_name(archive.stem)
-                    if not archive_images_dir.exists():
-                        archive_images_dir = images_dest / Path(archive.name).stem
-                    if not archive_images_dir.exists():
-                        archive_images_dir = images_dest
-                    
                     try:
-                        num_cleaned = watermark_remover.process_watermarks(archive_images_dir)
+                        num_cleaned = watermark_remover.process_watermarks(images_dest)
                         if num_cleaned > 0:
                             if interactive:
                                 print_status(f"  Cleaned watermarks from {num_cleaned} image(s)", "clean")
@@ -1059,20 +1219,13 @@ def process_archives(
                         else:
                             logger.warning(f"Watermark removal failed: {wm_err}")
                 
-                # Generate AI Description
-                if AI_GENERATOR_SUPPORT and moved_images:
+                # Generate AI Description once per project
+                if AI_GENERATOR_SUPPORT and all_moved_images:
                     if interactive:
                         print_status(f"  Generating AI description...", "progress")
                     
-                    archive_images_dir = images_dest / clean_name(archive.stem)
-                    if not archive_images_dir.exists():
-                        archive_images_dir = images_dest / Path(archive.name).stem
-                    if not archive_images_dir.exists():
-                        archive_images_dir = images_dest
-                    character_name = clean_name(archive.stem)
-                    
                     try:
-                        ai_success = ai_generator.create_description_file(character_name, archive_images_dir, project_folder)
+                        ai_success = ai_generator.create_description_file(clean_project_name, images_dest, project_folder)
                         if ai_success:
                             results['ai_descriptions'] = results.get('ai_descriptions', 0) + 1
                             if interactive:
@@ -1087,26 +1240,16 @@ def process_archives(
                         else:
                             logger.warning(f"AI generation failed: {ai_err}")
                 
-                # Find STL files
-                if interactive:
-                    print_status(f"  Finding STL files...", "progress")
-                stl_files = find_stl_files(eff_root)
-                results['total_stl_files'] += len(stl_files)
-                if interactive:
-                    print_status(f"  Found {len(stl_files)} STL files", "success")
-                
-                # Create STL ZIP
-                if stl_files:
+                # Create Unified STL ZIP
+                if all_stl_entries:
                     if interactive:
-                        print_status(f"  Creating STL ZIP...", "progress")
+                        print_status(f"  Creating Unified STL ZIP...", "progress")
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    clean_archive_stem = clean_name(archive.stem)
-                    zip_name = f"{clean_archive_stem}_STL_{timestamp}.zip"
-                    # Put ZIP inside the project folder
+                    zip_name = f"{clean_project_name}_STL_{timestamp}.zip"
                     zip_path = project_folder / zip_name
                     
                     created_zip = create_stl_zip(
-                        stl_files, zip_path, eff_root, flatten_stl_structure
+                        all_stl_entries, zip_path, None, flatten_stl_structure, multi_variant=is_multi_variant
                     )
                     
                     if created_zip:
@@ -1152,21 +1295,21 @@ def process_archives(
                                     logger.error(f"Upload failed for {zip_name}: {e}")
                                 results['errors'].append(f"Upload failed: {zip_name}")
                 
-                results['processed_archives'] += 1
+                results['processed_projects'] = results.get('processed_projects', 0) + 1
                 if interactive:
-                    print_status(f"  ✓ Archive completed successfully", "complete")
+                    print_status(f"  ✓ Project completed successfully", "complete")
             
             except Exception as e:
                 if interactive:
                     print_status(f"  Failed: {e}", "error")
                 else:
-                    logger.error(f"Failed to process {archive.name}: {e}")
-                results['errors'].append(f"Failed: {archive.name} - {e}")
+                    logger.error(f"Failed to process project {project_name}: {e}")
+                results['errors'].append(f"Failed: {project_name} - {e}")
         
         # Final progress update
         if interactive:
             print()
-            print_progress_bar(total_archives, total_archives, prefix="  Overall Progress")
+            print_progress_bar(total_projects, total_projects, prefix="  Overall Progress")
         
         # Step 4: Cleanup
         if cleanup_after:
