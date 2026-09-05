@@ -74,6 +74,29 @@ GEMINI_API_KEY = "your_google_gemini_api_key_here"
 GENERATE_AI_DESCRIPTION = True
 
 # ============================================================================
+# WATERMARK REMOVAL & IOPAINT CONFIGURATION
+# ============================================================================
+
+# Automatically remove studio watermarks using IOPaint
+REMOVE_WATERMARKS = True
+
+# Device for IOPaint inpainting:
+# Options: "auto", "cuda" (Nvidia GPU), "mps" (Apple Silicon), "cpu"
+# Note: On laptops with <= 2GB VRAM (such as GTX 950M), if you encounter CUDA
+# Out-of-Memory (OOM) errors on large images, set this to "cpu".
+IOPAINT_DEVICE = "auto"
+
+# Model name (default: "lama" - fast, high quality, robust)
+IOPAINT_MODEL = "lama"
+
+# Local directory to store/cache downloaded IOPaint models
+# Set to None to use default cache directory (~/.cache/iopaint)
+IOPAINT_MODEL_DIR = BASE_DIR / "models" / "iopaint"
+
+# Folder containing predefined studio mask templates (e.g., mask/ZEZ_Studios/mask.png)
+MASK_DIR = BASE_DIR / "mask"
+
+# ============================================================================
 # PROCESSING OPTIONS
 # ============================================================================
 

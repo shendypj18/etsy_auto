@@ -117,23 +117,32 @@ def safe_glob(directory):
 
 def get_studio_name(folder_name):
     studios = [
-        "MyAnimate", "ZEZ", "Zenith", "projectSTL", "magic_3dl", 
+        "Wicked", "3DWicked", "MyAnimate", "ZEZ", "Zenith", "projectSTL", "magic_3dl", 
         "Studio Cell Max", "MEET RABBIT", "CW Studio", "Nomnom", "Pablo Castaneda"
     ]
     for s in studios:
         if s.lower() in folder_name.lower():
+            if s in ["Wicked", "3DWicked"]: return "Wicked"
             if s == "ZEZ": return "ZEZ_Studios"
             if s == "Zenith": return "Zenith_Studios"
             if s == "Nomnom": return "Nomnom_Figures"
             return s
+
             
     if "-" in folder_name:
         return folder_name.split("-")[0].strip()
     return folder_name.split()[0]
 
 def main():
-    output_dir = Path("output")
-    mask_dir = Path("mask")
+    try:
+        from config import OUTPUT_DIR, MASK_DIR, BASE_DIR
+        output_dir = Path(OUTPUT_DIR).resolve()
+        mask_dir = Path(MASK_DIR).resolve() if MASK_DIR else (Path(BASE_DIR).resolve() / "mask")
+    except ImportError:
+        base_dir = Path(__file__).parent.resolve()
+        output_dir = base_dir / "output"
+        mask_dir = base_dir / "mask"
+
     mask_dir.mkdir(parents=True, exist_ok=True)
     
     # We only need 1 mask per studio.

@@ -39,3 +39,20 @@ tqdm>=4.64.0
 
 # Cryptography for Telegram (usually auto-installed with telethon)
 cryptography>=40.0.0
+
+# ============================================================================
+# AI Vision & Listing Generator (Gemini)
+# ============================================================================
+google-generativeai>=0.8.0
+pillow>=10.0.0
+
+# ============================================================================
+# Watermark Removal & AI Inpainting (IOPaint + OCR)
+# ============================================================================
+opencv-python>=4.8.0
+easyocr>=1.7.0
+numpy>=1.24.0
+torch>=2.1.0
+torchvision>=0.16.0
+iopaint>=1.2.0
+

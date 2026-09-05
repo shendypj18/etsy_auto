@@ -2,14 +2,23 @@ import os
 import shutil
 from pathlib import Path
 
-output_dir = Path("output")
-mask_dir = Path("mask")
+try:
+    from config import OUTPUT_DIR, MASK_DIR, BASE_DIR
+    output_dir = Path(OUTPUT_DIR).resolve()
+    mask_dir = Path(MASK_DIR).resolve() if MASK_DIR else (Path(BASE_DIR).resolve() / "mask")
+except ImportError:
+    base_dir = Path(__file__).parent.resolve()
+    output_dir = base_dir / "output"
+    mask_dir = base_dir / "mask"
 
 if not mask_dir.exists():
     mask_dir.mkdir(parents=True)
 
+
 # Common studio names to prioritize
 studios = [
+    "Wicked",
+    "3DWicked",
     "MyAnimate",
     "ZEZ",
     "Zenith",
@@ -39,10 +48,12 @@ for root, dirs, files in os.walk(output_dir):
             if s.lower() in inner_folder_name.lower():
                 studio_name = s
                 # Standardize some names
+                if studio_name in ["Wicked", "3DWicked"]: studio_name = "Wicked"
                 if studio_name == "ZEZ": studio_name = "ZEZ_Studios"
                 if studio_name == "Zenith": studio_name = "Zenith_Studios"
                 if studio_name == "Nomnom": studio_name = "Nomnom_Figures"
                 break
+
                 
         # Fallback if no known studio found:
         if not studio_name:

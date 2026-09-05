@@ -50,6 +50,11 @@ except ImportError as e:
     sys.exit(1)
 
 try:
+    from config import REMOVE_WATERMARKS
+except ImportError:
+    REMOVE_WATERMARKS = True
+
+try:
     from telegram_watcher import TelegramWatcher, TELETHON_AVAILABLE
 except ImportError:
     TELETHON_AVAILABLE = False
@@ -60,11 +65,19 @@ except ImportError:
     PYDRIVE_AVAILABLE = False
 
 try:
+    import watermark_remover
+    WATERMARK_REMOVAL_SUPPORT = True
+except ImportError as e:
+    WATERMARK_REMOVAL_SUPPORT = False
+    logger.warning(f"Watermark remover module not fully available: {e}. Watermark removal will be skipped.")
+
+try:
     import ai_generator
     AI_GENERATOR_SUPPORT = True
 except ImportError as e:
     AI_GENERATOR_SUPPORT = False
     logger.warning(f"AI generator module not fully available: {e}. AI description generation will be skipped.")
+
 
 try:
     import rarfile
@@ -160,12 +173,15 @@ class FileProcessor:
         output_dir: Path = None,
         keep_images: bool = KEEP_IMAGES,
         stl_zip_name: str = STL_ZIP_FILENAME,
-        flatten_structure: bool = FLATTEN_STL_STRUCTURE
+        flatten_structure: bool = FLATTEN_STL_STRUCTURE,
+        remove_watermarks: bool = REMOVE_WATERMARKS
     ):
         self.output_dir = Path(output_dir or OUTPUT_DIR)
         self.keep_images = keep_images
         self.stl_zip_name = stl_zip_name
         self.flatten_structure = flatten_structure
+        self.remove_watermarks = remove_watermarks
+
 
     def _clean_name(self, text: str) -> str:
         """Helper to cleanup names based on CLEAN_PATTERNS."""
@@ -282,7 +298,19 @@ class FileProcessor:
                             dest = dest.parent / f"{stem}_{counter}{suffix}"
                             counter += 1
                     shutil.move(str(img), str(dest))
-            
+
+                # Step 3.2: Watermark Removal with IOPaint
+                if getattr(self, "remove_watermarks", True) and WATERMARK_REMOVAL_SUPPORT:
+                    logger.info(f"{Colors.BLUE}🪄 Scanning and cleaning watermarks with IOPaint...{Colors.END}")
+                    try:
+                        num_cleaned = watermark_remover.process_watermarks(images_dir)
+                        if num_cleaned > 0:
+                            logger.info(f"{Colors.GREEN}✓ Cleaned watermarks from {num_cleaned} image(s){Colors.END}")
+                        else:
+                            logger.info("   No watermarks found or processed")
+                    except Exception as wm_err:
+                        logger.warning(f"{Colors.YELLOW}⚠️ Watermark removal skipped/failed: {wm_err}{Colors.END}")
+
             # Step 3.5: AI Description Generation
             if AI_GENERATOR_SUPPORT and images:
                 logger.info(f"{Colors.BLUE}🤖 Generating AI description...{Colors.END}")
@@ -380,7 +408,8 @@ class Orchestrator:
             output_dir=OUTPUT_DIR,
             keep_images=KEEP_IMAGES,
             stl_zip_name=STL_ZIP_FILENAME,
-            flatten_structure=FLATTEN_STL_STRUCTURE
+            flatten_structure=FLATTEN_STL_STRUCTURE,
+            remove_watermarks=REMOVE_WATERMARKS
         )
         self.gdrive: Optional[GDriveHandler] = None
         self._running = False

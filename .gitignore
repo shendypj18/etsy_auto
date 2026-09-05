@@ -48,6 +48,11 @@ block.txt
 clean.txt
 archive/
 archives/
-mask/
 test_image/
 images_list.txt
+*_masks/
+*_cleaned/
+models/
+*.pt
+
+

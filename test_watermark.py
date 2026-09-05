@@ -1,8 +1,11 @@
 import os
+import sys
 import cv2
 import easyocr
 import subprocess
 import numpy as np
+from pathlib import Path
+from watermark_remover import detect_device, get_iopaint_cmd, IOPAINT_MODEL_DIR, IOPAINT_MODEL
 
 def create_mask(image_path, mask_path, keywords=None):
     """
@@ -101,29 +104,52 @@ def create_mask(image_path, mask_path, keywords=None):
 def clean_image_iopaint(image_path, mask_path, out_dir):
     """
     Runs the IOPaint CLI to remove the watermark based on the generated mask.
+    Automatically detects CUDA / MPS / CPU and falls back to CPU if needed.
     """
-    print(f"\n👉 4. [IOPaint] Mulai menghapus watermark menggunakan Apple GPU (MPS)...")
-    print(f"    (Model: LaMa. File: {image_path})")
+    base_cmd = get_iopaint_cmd()
+    if not base_cmd:
+        print(f"❌ Error: IOPaint tidak ditemukan di Python environment ini.")
+        print(f"   Jalankan: {sys.executable} -m pip install iopaint")
+        return
+
+    device = detect_device()
+    model_name = IOPAINT_MODEL or "lama"
+
+    print(f"\n👉 4. [IOPaint] Mulai menghapus watermark menggunakan device: '{device}'...")
+    print(f"    (Model: {model_name}. File: {image_path})")
     print(f"    Tunggu sebentar... IOPaint sedang melakukan proses rendering...")
-    
-    # We use subprocess to run the IOPaint CLI.
-    # --device mps triggers the Apple Silicon acceleration
-    cmd = [
-        "iopaint", "run",
-        "--image", image_path,
-        "--mask", mask_path,
-        "--output", out_dir,
-        "--model", "lama",
-        "--device", "mps",
-        "--model-dir", "/Volumes/Surigiwa/iopaint_models"
-    ]
-    
+
+    model_dir_args = []
+    if IOPAINT_MODEL_DIR:
+        model_dir_path = Path(IOPAINT_MODEL_DIR).resolve()
+        model_dir_path.mkdir(parents=True, exist_ok=True)
+        model_dir_args = ["--model-dir", str(model_dir_path)]
+
+    cmd = base_cmd + [
+        "run",
+        "--image", str(Path(image_path).resolve()),
+        "--mask", str(Path(mask_path).resolve()),
+        "--output", str(Path(out_dir).resolve()),
+        "--model", model_name,
+        "--device", device,
+    ] + model_dir_args
+
     try:
-        # Menghilangkan capture_output agar loading bawaan IOPaint kelihatan di terminal
         subprocess.run(cmd, check=True)
         print(f"✅ Selesai! Foto bersih sudah disimpan di {out_dir}")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Error saat menjalankan IOPaint: {e}")
+        print(f"❌ Error saat menjalankan IOPaint di device '{device}': {e}")
+        if device != "cpu":
+            print("🔄 Mencoba fallback otomatis menggunakan CPU...")
+            cpu_cmd = list(cmd)
+            dev_idx = cpu_cmd.index("--device")
+            cpu_cmd[dev_idx + 1] = "cpu"
+            try:
+                subprocess.run(cpu_cmd, check=True)
+                print(f"✅ Berhasil selesai menggunakan CPU fallback! Disimpan di {out_dir}")
+            except subprocess.CalledProcessError as cpu_err:
+                print(f"❌ CPU fallback juga gagal: {cpu_err}")
+
 
 if __name__ == "__main__":
     import argparse

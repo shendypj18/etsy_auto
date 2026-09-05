@@ -1,16 +1,23 @@
 import os
+import sys
+import argparse
 from pathlib import Path
 import watermark_remover
+
+try:
+    from config import OUTPUT_DIR
+except ImportError:
+    OUTPUT_DIR = Path(__file__).parent.resolve() / "output"
 
 def clean_existing_outputs(output_folder_path: str):
     """
     Scans the existing output directory for 'Images' folders inside project folders
     and runs the watermark remover on them.
     """
-    output_path = Path(output_folder_path)
+    output_path = Path(output_folder_path).resolve()
     
     if not output_path.exists() or not output_path.is_dir():
-        print(f"Error: Output folder not found -> {output_folder_path}")
+        print(f"Error: Output folder not found -> {output_path}")
         return
 
     print(f"Scanning {output_path} for existing images to clean...")
@@ -48,7 +55,17 @@ def clean_existing_outputs(output_folder_path: str):
                     print(f"  -> Error processing {d.name}: {e}")
 
 if __name__ == "__main__":
-    target_output_folder = "/Volumes/Surigiwa/etsy-auto/output"
-    print(f"Starting batch watermark removal for {target_output_folder}")
+    parser = argparse.ArgumentParser(description="Batch clean watermarks from existing output folders.")
+    parser.add_argument(
+        "--folder",
+        type=str,
+        default=str(OUTPUT_DIR),
+        help=f"Path to output directory (default: {OUTPUT_DIR})"
+    )
+    args = parser.parse_args()
+
+    target_output_folder = args.folder
+    print(f"Starting batch watermark removal for: {target_output_folder}")
     clean_existing_outputs(target_output_folder)
     print("\nCompleted batch processing.")
+
