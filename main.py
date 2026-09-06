@@ -13,10 +13,17 @@ Author: Shendy PJ
 
 import os
 import sys
+import warnings
+# Filter noisy warnings on older Python versions
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Python 3.7.*")
+
 import asyncio
 import signal
 import logging
 import shutil
+import argparse
 import zipfile
 from pathlib import Path
 from datetime import datetime
@@ -38,6 +45,7 @@ try:
         FLATTEN_STL_STRUCTURE,
         LOG_LEVEL,
         COLORED_OUTPUT,
+        Colors,
         BLACKLIST_PATTERNS,
         CLEAN_PATTERNS,
         SIZE_BLOCK_RULES,
@@ -56,7 +64,7 @@ except ImportError:
 
 try:
     from telegram_watcher import TelegramWatcher, TELETHON_AVAILABLE
-except ImportError:
+except Exception:
     TELETHON_AVAILABLE = False
 
 try:
@@ -69,14 +77,14 @@ try:
     WATERMARK_REMOVAL_SUPPORT = True
 except ImportError as e:
     WATERMARK_REMOVAL_SUPPORT = False
-    logger.warning(f"Watermark remover module not fully available: {e}. Watermark removal will be skipped.")
+    print(f"Watermark remover module not fully available: {e}. Watermark removal will be skipped.")
 
 try:
     import ai_generator
     AI_GENERATOR_SUPPORT = True
 except ImportError as e:
     AI_GENERATOR_SUPPORT = False
-    logger.warning(f"AI generator module not fully available: {e}. AI description generation will be skipped.")
+    print(f"AI generator module not fully available: {e}. AI description generation will be skipped.")
 
 
 try:
@@ -96,21 +104,23 @@ except ImportError:
 # ============================================================================
 
 class ColoredFormatter(logging.Formatter):
-    """Custom formatter with colors."""
+    """Custom formatter with colors and clean column alignment."""
     
     COLORS = {
-        'DEBUG': '\033[94m',
-        'INFO': '\033[92m',
-        'WARNING': '\033[93m',
-        'ERROR': '\033[91m',
-        'CRITICAL': '\033[91m\033[1m',
+        'DEBUG': Colors.BLUE,
+        'INFO': Colors.GREEN,
+        'WARNING': Colors.YELLOW,
+        'ERROR': Colors.RED,
+        'CRITICAL': Colors.RED + Colors.BOLD,
     }
-    RESET = '\033[0m'
     
     def format(self, record):
-        if COLORED_OUTPUT:
+        level_padded = record.levelname.ljust(7)
+        if COLORED_OUTPUT and Colors.END:
             color = self.COLORS.get(record.levelname, '')
-            record.levelname = f"{color}{record.levelname}{self.RESET}"
+            record.colored_level = f"{color}{level_padded}{Colors.END}"
+        else:
+            record.colored_level = level_padded
         return super().format(record)
 
 
@@ -124,7 +134,7 @@ def setup_logging():
     handler.setLevel(logging.DEBUG)
     
     formatter = ColoredFormatter(
-        "%(asctime)s | %(levelname)-18s | %(message)s",
+        "%(asctime)s | %(colored_level)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     handler.setFormatter(formatter)
@@ -134,26 +144,6 @@ def setup_logging():
 
 
 logger = setup_logging()
-
-
-# ============================================================================
-# COLORS FOR TERMINAL OUTPUT
-# ============================================================================
-
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BOLD = '\033[1m'
-    END = '\033[0m'
-
-if not COLORED_OUTPUT:
-    for attr in dir(Colors):
-        if not attr.startswith('_'):
-            setattr(Colors, attr, '')
 
 
 # ============================================================================
@@ -174,13 +164,15 @@ class FileProcessor:
         keep_images: bool = KEEP_IMAGES,
         stl_zip_name: str = STL_ZIP_FILENAME,
         flatten_structure: bool = FLATTEN_STL_STRUCTURE,
-        remove_watermarks: bool = REMOVE_WATERMARKS
+        remove_watermarks: bool = False,
+        allow_all: bool = False
     ):
         self.output_dir = Path(output_dir or OUTPUT_DIR)
         self.keep_images = keep_images
         self.stl_zip_name = stl_zip_name
         self.flatten_structure = flatten_structure
         self.remove_watermarks = remove_watermarks
+        self.allow_all = allow_all
 
 
     def _clean_name(self, text: str) -> str:
@@ -252,19 +244,19 @@ class FileProcessor:
                 if not f.is_file():
                     continue
                     
-                # Blacklist check (against relative path to avoid blocking entire folder by mistake if not intended)
-                # But here we use path string as before for safety
-                rel_path_str = str(f.relative_to(eff_root)).lower()
-                if any(pattern.lower() in rel_path_str for pattern in BLACKLIST_PATTERNS):
-                    logger.debug(f"   Skipping blacklisted: {f.name}")
-                    continue
-                
-                # Smart Blocking check
-                if f.name in SIZE_BLOCK_RULES:
-                    threshold = SIZE_BLOCK_RULES[f.name]
-                    if f.stat().st_size < threshold:
-                        logger.debug(f"   Smart blocking {f.name} (too small)")
+                if not self.allow_all:
+                    # Blacklist check (against relative path to avoid blocking entire folder by mistake if not intended)
+                    rel_path_str = str(f.relative_to(eff_root)).lower()
+                    if any(pattern.lower() in rel_path_str for pattern in BLACKLIST_PATTERNS):
+                        logger.debug(f"   Skipping blacklisted: {f.name}")
                         continue
+                    
+                    # Smart Blocking check
+                    if f.name in SIZE_BLOCK_RULES:
+                        threshold = SIZE_BLOCK_RULES[f.name]
+                        if f.stat().st_size < threshold:
+                            logger.debug(f"   Smart blocking {f.name} (too small)")
+                            continue
                 
                 ext = f.suffix.lower()
                 if ext in IMAGE_EXTENSIONS:
@@ -355,18 +347,35 @@ class FileProcessor:
         """Extract archive to destination."""
         dest.mkdir(parents=True, exist_ok=True)
         
+        # Priority 1: Use native 7-Zip (7z.exe) for 50x speed and rock-solid reliability
+        import subprocess
+        sevenzip_candidates = [
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+            shutil.which("7z") or shutil.which("7za")
+        ]
+        sevenzip_bin = next((c for c in sevenzip_candidates if c and os.path.exists(c)), None)
+        
+        if sevenzip_bin:
+            cmd = [sevenzip_bin, "x", str(archive_path.resolve()), f"-o{dest.resolve()}", "-y", "-bso0"]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                return
+            logger.warning(f"7z.exe extraction returned {res.returncode}, falling back to Python libraries: {res.stderr}")
+
+        # Fallback to Python libraries
         ext = archive_path.suffix.lower()
-        if archive_path.suffix.lower() == ".zip":
+        if ext == ".zip":
             with zipfile.ZipFile(archive_path, 'r') as zf:
                 zf.extractall(dest)
         
-        elif archive_path.suffix.lower() == ".rar":
+        elif ext == ".rar":
             if not RAR_SUPPORT:
                 raise ImportError("rarfile library not installed for .rar support")
             with rarfile.RarFile(archive_path, 'r') as rar_ref:
                 rar_ref.extractall(dest)
         
-        elif archive_path.suffix.lower() == ".7z":
+        elif ext == ".7z":
             if not SEVENZIP_SUPPORT:
                 raise ImportError("py7zr library not installed for .7z support")
             with py7zr.SevenZipFile(archive_path, mode='r') as z_ref:
@@ -402,14 +411,15 @@ class Orchestrator:
     - GDrive Handler
     """
     
-    def __init__(self):
+    def __init__(self, allow_all: bool = False, remove_watermarks: bool = False):
         self.watcher: Optional[TelegramWatcher] = None
         self.processor = FileProcessor(
             output_dir=OUTPUT_DIR,
             keep_images=KEEP_IMAGES,
             stl_zip_name=STL_ZIP_FILENAME,
             flatten_structure=FLATTEN_STL_STRUCTURE,
-            remove_watermarks=REMOVE_WATERMARKS
+            remove_watermarks=remove_watermarks,
+            allow_all=allow_all
         )
         self.gdrive: Optional[GDriveHandler] = None
         self._running = False
@@ -442,8 +452,7 @@ class Orchestrator:
 ║  {Colors.END}  ✓ Generate link_download_here.txt                               {Colors.CYAN}║
 ╚══════════════════════════════════════════════════════════════════════╝
 {Colors.END}""")
-    
-    async def on_file_downloaded(self, file_path: Path, filename: str):
+    async def on_file_downloaded(self, file_path: Path, filename: str, delete_source: bool = True):
         """
         Callback when a file is downloaded from Telegram.
         
@@ -507,11 +516,12 @@ class Orchestrator:
                         logger.error("Upload failed, keeping local file")
                 else:
                     logger.warning("GDrive not configured, skipping upload")
-            
             # Step 5: Delete original downloaded archive
-            if file_path.exists():
+            if delete_source and file_path.exists():
                 file_path.unlink()
                 logger.info(f"{Colors.GREEN}✓ Deleted download: {filename}{Colors.END}")
+            elif not delete_source:
+                logger.info(f"{Colors.GREEN}✓ Kept local archive: {filename}{Colors.END}")
             
             # Summary
             logger.info(f"\n{Colors.GREEN}{'=' * 60}{Colors.END}")
@@ -604,6 +614,42 @@ class Orchestrator:
         self._shutdown_event.set()
         logger.info(f"{Colors.GREEN}✓ Shutdown complete{Colors.END}")
 
+    async def process_local_directory(self, directory_path: str, filter_keyword: str = None, upload_to_drive: bool = True):
+        """Process all archives in a local directory without deleting them."""
+        self.print_banner()
+        
+        dir_path = Path(directory_path)
+        if not dir_path.exists():
+            logger.error(f"{Colors.RED}Directory not found: {dir_path}{Colors.END}")
+            return
+            
+        # Initialize GDrive if needed
+        if upload_to_drive and PYDRIVE_AVAILABLE:
+            self.gdrive = GDriveHandler()
+            if not self.gdrive.authenticate():
+                logger.warning("GDrive authentication failed")
+                self.gdrive = None
+        else:
+            self.gdrive = None
+                
+        # Find all matching archive files
+        matched_files = []
+        for file_path in dir_path.glob("*"):
+            if file_path.is_file() and file_path.suffix.lower() in [".zip", ".rar", ".7z"]:
+                if filter_keyword and filter_keyword.lower() not in file_path.name.lower():
+                    continue
+                matched_files.append(file_path)
+
+        # Sort archives from oldest to newest (by file modification time)
+        matched_files.sort(key=lambda f: f.stat().st_mtime)
+
+        logger.info(f"{Colors.BLUE}Found {len(matched_files)} archive(s) matching filter. Processing oldest first...{Colors.END}")
+
+        for file_path in matched_files:
+            file_date = datetime.fromtimestamp(file_path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            logger.info(f"\n{Colors.CYAN}Found local file: {file_path.name} (Date: {file_date}){Colors.END}")
+            await self.on_file_downloaded(file_path, file_path.name, delete_source=False)
+
 
 # ============================================================================
 # MAIN ENTRY POINT
@@ -611,10 +657,25 @@ class Orchestrator:
 
 def main():
     """Main entry point."""
-    orchestrator = Orchestrator()
+    parser = argparse.ArgumentParser(description="Telegram to Google Drive Automation")
+    parser.add_argument("--local-dir", type=str, help="Process archives from a local directory instead of Telegram")
+    parser.add_argument("--filter", type=str, help="Filter local archives by keyword")
+    parser.add_argument("--no-upload", action="store_true", help="Skip Google Drive upload")
+    parser.add_argument("--watermark", action="store_true", help="Run IOPaint watermark removal immediately (default: skip to run later)")
+    parser.add_argument("--allow-all", action="store_true", help="Allow all files, skipping blacklist/size-block rules")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored terminal output")
+    args = parser.parse_args()
+
+    if args.no_color:
+        Colors.disable()
+
+    orchestrator = Orchestrator(allow_all=args.allow_all, remove_watermarks=args.watermark)
     
     try:
-        asyncio.run(orchestrator.start())
+        if args.local_dir:
+            asyncio.run(orchestrator.process_local_directory(args.local_dir, args.filter, upload_to_drive=not args.no_upload))
+        else:
+            asyncio.run(orchestrator.start())
     except KeyboardInterrupt:
         print("\nExiting...")
     except Exception as e:

@@ -34,8 +34,9 @@ aiofiles>=23.0.0
 # Optional Dependencies
 # ============================================================================
 
-# Better progress display
+# Better progress display & Windows console colors
 tqdm>=4.64.0
+colorama>=0.4.6
 
 # Cryptography for Telegram (usually auto-installed with telethon)
 cryptography>=40.0.0

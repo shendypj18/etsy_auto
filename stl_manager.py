@@ -13,6 +13,11 @@ Author: Shendy PJ
 
 import os
 import sys
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Python 3.7.*")
+
 import shutil
 import zipfile
 import logging
@@ -51,7 +56,8 @@ except ImportError:
 try:
     from config import (
         BLACKLIST_PATTERNS, FLATTEN_STL_STRUCTURE, LINK_FILENAME, 
-        CLEAN_PATTERNS, SIZE_BLOCK_RULES, DELETE_AFTER_UPLOAD
+        CLEAN_PATTERNS, SIZE_BLOCK_RULES, DELETE_AFTER_UPLOAD,
+        Colors, COLORED_OUTPUT
     )
 except ImportError:
     BLACKLIST_PATTERNS = ["+NSFW", ".url", ".txt", "Boost"]
@@ -235,17 +241,23 @@ def group_archives_by_project(archive_paths: List[Path]) -> Dict[str, List[Path]
 # TERMINAL DISPLAY & COLORS
 # ============================================================================
 
-class Colors:
-    """ANSI color codes for terminal display."""
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    END = '\033[0m'
+if 'Colors' not in globals() or not hasattr(Colors, 'disable'):
+    class Colors:
+        """ANSI color codes for terminal display."""
+        HEADER = '\033[95m'
+        BLUE = '\033[94m'
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        RED = '\033[91m'
+        BOLD = '\033[1m'
+        UNDERLINE = '\033[4m'
+        END = '\033[0m'
+
+        @classmethod
+        def disable(cls):
+            for attr in ['HEADER', 'BLUE', 'CYAN', 'GREEN', 'YELLOW', 'RED', 'BOLD', 'UNDERLINE', 'END']:
+                setattr(cls, attr, '')
 
 
 def print_banner():
@@ -463,7 +475,7 @@ def scan_for_archives(source_folder: str) -> List[Path]:
         ])
     
     archives = []
-    for arch in sorted(found_files):
+    for arch in sorted(found_files, key=lambda f: f.stat().st_mtime):
         name = arch.name.lower()
         
         # Handle RAR multi-part (.part1.rar, .part2.rar)
@@ -825,7 +837,7 @@ def upload_to_gdrive(
     file_path: Path, 
     folder_id: Optional[str] = None,
     show_progress: bool = True
-) -> tuple[str, str]:
+) -> Tuple[str, str]:
     """
     Upload a file to Google Drive.
     
@@ -1575,7 +1587,16 @@ Examples:
         help="Disable interactive terminal display (use logging instead)"
     )
     
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable colored terminal output"
+    )
+    
     args = parser.parse_args()
+    
+    if args.no_color:
+        Colors.disable()
     
     # Update logging level if verbose
     if args.verbose:

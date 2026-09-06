@@ -88,11 +88,22 @@ def get_iopaint_cmd() -> Optional[List[str]]:
     if iopaint_bin:
         return [iopaint_bin]
 
-    # 3. Check iopaint_env conda environment if available on system
+    # 3. Check known conda/virtualenv paths and Anaconda installations
+    home = Path.home()
     current_py = Path(sys.executable).resolve()
-    # Typical conda envs: miniconda3/envs/iopaint_env/...
     potential_envs = [
+        # Anaconda / Miniconda in User profile
+        home / "anaconda3" / "Scripts" / "iopaint.exe",
+        home / "anaconda3" / "python.exe",
+        home / "miniconda3" / "Scripts" / "iopaint.exe",
+        home / "miniconda3" / "python.exe",
+        home / "anaconda3" / "envs" / "iopaint_env" / "Scripts" / "iopaint.exe",
+        home / "anaconda3" / "envs" / "iopaint_env" / "python.exe",
+        home / "miniconda3" / "envs" / "iopaint_env" / "Scripts" / "iopaint.exe",
+        home / "miniconda3" / "envs" / "iopaint_env" / "python.exe",
+        # Local to current python
         current_py.parent / "iopaint",
+        current_py.parent / "Scripts" / "iopaint.exe",
         current_py.parent.parent / "envs" / "iopaint_env" / "bin" / "iopaint",
         current_py.parent.parent / "envs" / "iopaint_env" / "Scripts" / "iopaint.exe",
         current_py.parent.parent / "envs" / "iopaint_env" / "bin" / "python",
@@ -101,8 +112,14 @@ def get_iopaint_cmd() -> Optional[List[str]]:
     for p in potential_envs:
         if p.exists():
             if "python" in p.name.lower():
-                return [str(p), "-m", "iopaint"]
-            return [str(p)]
+                try:
+                    res = subprocess.run([str(p), "-m", "iopaint", "--help"], capture_output=True, text=True, timeout=5)
+                    if res.returncode == 0:
+                        return [str(p), "-m", "iopaint"]
+                except Exception:
+                    continue
+            else:
+                return [str(p)]
 
     return None
 
@@ -277,7 +294,8 @@ def _clean_single_folder_watermarks(target_dir: Path, studio_name: str, mask_tem
                         res_img = cv2.imread(str(cleaned_img))
                         if res_img is not None:
                             cv2.imwrite(str(img_path), res_img)
-                            cleaned_img.unlink(missing_ok=True)
+                            if cleaned_img.exists():
+                                cleaned_img.unlink()
                         else:
                             shutil.move(str(cleaned_img), str(img_path))
                     num_cleaned += 1
@@ -321,12 +339,14 @@ def process_watermarks(image_folder: Path) -> int:
         # Determine studio name from folder hierarchy
         studio_name = get_studio_name(target_dir.name)
         if not (mask_root / studio_name / "mask.png").exists():
-            # Check parent folder names up to image_folder
+            # Check current folder and all ancestor folders
             curr = target_dir
-            while curr != image_folder.parent and curr != curr.parent:
+            while curr and curr != curr.parent:
                 s = get_studio_name(curr.name)
                 if (mask_root / s / "mask.png").exists():
                     studio_name = s
+                    break
+                if curr == BASE_DIR or curr.name.lower() in ["output", "downloads"]:
                     break
                 curr = curr.parent
 
